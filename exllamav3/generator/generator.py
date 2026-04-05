@@ -148,9 +148,12 @@ class Generator:
         # Defrag
         self.enable_defrag = enable_defrag
 
-        # Recurrent cache
+        # Recurrent cache — stores periodic snapshots of recurrent state to CPU
+        # for prefix caching. Disabled in TP because CUDA tensors from worker
+        # processes can't be pickled back to the main process for stashing.
+        # TODO: implement per-worker stashing to enable prefix caching in TP.
         self.recurrent_cache_size = recurrent_cache_size
-        if self.model.caps.get("recurrent_states"):
+        if self.model.caps.get("recurrent_states") and not self.model.loaded_tp:
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
         else:
             self.recurrent_cache = None
