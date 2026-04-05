@@ -588,16 +588,25 @@ class GatedDeltaNet(Module):
         rs = params.get("recurrent_states")
         if rs is not None:
             if self.tp_mode:
-                # TP: use module-local recurrent states. These persist in each
-                # worker process and are never passed through params (which gets
-                # pickled, and CUDA tensors can't cross process boundaries).
+                # TP: prefer module-local CUDA states (from previous forward),
+                # fall back to CPU checkpoint in rs (restored from cache),
+                # fall back to zeros (fresh sequence).
                 if not hasattr(self, '_tp_conv_state'):
                     self._tp_conv_state = None
                     self._tp_recurrent_state = None
-                conv_state = self._tp_conv_state if self._tp_conv_state is not None else \
-                    torch.zeros((bsz, self.fdim_qkv, self.conv_kernel_size), dtype=torch.bfloat16, device=self.device)
-                recurrent_state = self._tp_recurrent_state if self._tp_recurrent_state is not None else \
-                    torch.zeros(
+                rs_layer = rs[self.layer_idx]
+                if self._tp_conv_state is not None:
+                    conv_state = self._tp_conv_state
+                elif rs_layer.last_conv_state is not None:
+                    conv_state = rs_layer.last_conv_state.to(device=self.device)
+                else:
+                    conv_state = torch.zeros((bsz, self.fdim_qkv, self.conv_kernel_size), dtype=torch.bfloat16, device=self.device)
+                if self._tp_recurrent_state is not None:
+                    recurrent_state = self._tp_recurrent_state
+                elif rs_layer.last_recurrent_state is not None:
+                    recurrent_state = rs_layer.last_recurrent_state.to(device=self.device)
+                else:
+                    recurrent_state = torch.zeros(
                         (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
                         dtype=torch.float, device=self.device
                     )
@@ -815,11 +824,19 @@ class GatedDeltaNet(Module):
         # Update cache
         if save_state:
             if self.tp_mode:
-                # Store in module-local state (persists in each TP worker).
-                # Don't write to params["recurrent_states"] — it gets pickled
-                # across processes and CUDA tensors can't cross that boundary.
+                # Keep CUDA tensors module-local for the forward pass
                 self._tp_recurrent_state = recurrent_state
                 self._tp_conv_state = conv_state
+                # Write CPU copies to rs for checkpointing. rs gets pickled
+                # across TP processes so it can't hold CUDA tensors, but CPU
+                # tensors are fine. stash() calls .cpu() which is a no-op.
+                rs_layer = params["recurrent_states"][self.layer_idx]
+                rs_layer.last_recurrent_state = recurrent_state.cpu()
+                rs_layer.last_conv_state = conv_state.cpu()
+                if not rs_layer.batched:
+                    rs_layer.position += seqlen
+                else:
+                    rs_layer.positions = [r + seqlen for r in rs_layer.positions]
             else:
                 rs.last_recurrent_state = recurrent_state
                 rs.last_conv_state = conv_state
