@@ -148,12 +148,9 @@ class Generator:
         # Defrag
         self.enable_defrag = enable_defrag
 
-        # Recurrent cache — disabled in TP mode because each worker holds its own
-        # head-sharded recurrent state and we can't gather/scatter them through the
-        # CPU-side checkpoint cache yet. This means no prefix caching for recurrent
-        # layers in TP mode — each request re-runs the recurrent layers from scratch.
+        # Recurrent cache
         self.recurrent_cache_size = recurrent_cache_size
-        if self.model.caps.get("recurrent_states") and not self.model.loaded_tp:
+        if self.model.caps.get("recurrent_states"):
             self.recurrent_cache = RecurrentCache(self.model, recurrent_cache_size)
         else:
             self.recurrent_cache = None
