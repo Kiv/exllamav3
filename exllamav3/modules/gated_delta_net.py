@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from ..model.config import Config
 from ..util.tensor import get_for_device, to2
 from . import Module, Linear
+from .multilinear import MultiLinear
 from ..ext import exllamav3_ext as ext
 from ..model.model_tp_alloc import TPAllocation
 from .gated_rmsnorm import GatedRMSNorm
@@ -190,11 +191,13 @@ class GDN_RecurrentState(CacheableState):
     @override
     def stash(self):
         # TODO: Option to preallocate and pin space for stashed states
+        # In TP mode, states live on each module directly (_tp_conv_state etc.)
+        # and these fields are None — stash is a no-op.
         return GDN_RecurrentState(
             self.position,
             self.positions,
-            self.last_conv_state.cpu(),
-            self.last_recurrent_state.cpu()
+            self.last_conv_state.cpu() if self.last_conv_state is not None else None,
+            self.last_recurrent_state.cpu() if self.last_recurrent_state is not None else None,
         )
 
     @override
@@ -202,8 +205,8 @@ class GDN_RecurrentState(CacheableState):
         return GDN_RecurrentState(
             self.position,
             self.positions,
-            self.last_conv_state.to(device, non_blocking = True),
-            self.last_recurrent_state.to(device, non_blocking = True),
+            self.last_conv_state.to(device, non_blocking = True) if self.last_conv_state is not None else None,
+            self.last_recurrent_state.to(device, non_blocking = True) if self.last_recurrent_state is not None else None,
         )
 
     @override
@@ -427,11 +430,14 @@ class GatedDeltaNet(Module):
         self.bc = None
         self.bsz1_pa_args = []
 
-        # self.cache_layers = []
-        # self.tp_cache_lookup = {}
-        # self.multi_kv = None
-        # self.tp_reduce = False
-        # self.has_split_cache = False
+        # TP mode flags (set by tp_import)
+        self.tp_mode = False
+        self.tp_reduce = False
+        self.q_proj_tp = None
+        self.k_proj_tp = None
+        self.v_proj_tp = None
+        self.multi_qk = None
+        self.multi_vz = None
 
 
     @override
@@ -583,15 +589,31 @@ class GatedDeltaNet(Module):
         # Previous state
         rs = params.get("recurrent_states")
         if rs is not None:
-            rs = rs[self.layer_idx]
-            conv_state = rs.last_conv_state if rs.last_conv_state is not None else \
-                torch.zeros((bsz, self.fdim_qkv, self.conv_kernel_size), dtype = torch.bfloat16, device = x.device)
-            recurrent_state = rs.last_recurrent_state if rs.last_recurrent_state is not None else \
-                torch.zeros(
-                    (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
-                    dtype = torch.float,
-                    device = self.device
-                )
+            if self.tp_mode:
+                # TP: use module-local recurrent states instead of params.
+                # In TP, child processes receive pickled copies of the main process's
+                # recurrent_states, which are GPU 0's head-sharded states — wrong for
+                # other GPUs. So each module maintains its own per-worker states.
+                if not hasattr(self, '_tp_conv_state'):
+                    self._tp_conv_state = None
+                    self._tp_recurrent_state = None
+                conv_state = self._tp_conv_state if self._tp_conv_state is not None else \
+                    torch.zeros((bsz, self.fdim_qkv, self.conv_kernel_size), dtype=torch.bfloat16, device=self.device)
+                recurrent_state = self._tp_recurrent_state if self._tp_recurrent_state is not None else \
+                    torch.zeros(
+                        (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
+                        dtype=torch.float, device=self.device
+                    )
+            else:
+                rs = rs[self.layer_idx]
+                conv_state = rs.last_conv_state if rs.last_conv_state is not None else \
+                    torch.zeros((bsz, self.fdim_qkv, self.conv_kernel_size), dtype = torch.bfloat16, device = x.device)
+                recurrent_state = rs.last_recurrent_state if rs.last_recurrent_state is not None else \
+                    torch.zeros(
+                        (bsz, self.num_v_heads, self.k_head_dim, self.v_head_dim),
+                        dtype = torch.float,
+                        device = self.device
+                    )
 
             save_state = True
         else:
@@ -621,7 +643,59 @@ class GatedDeltaNet(Module):
             # while Qwen3-Next uses fused projections. The fused C++ helper expects the
             # packed layout used by fused projections; applying it to split qkv tensors
             # causes incorrect head ordering and broken generations.
-            if self.qkvz_proj is not None and self.ba_proj is not None:
+            if self.tp_mode and self.q_proj_tp is not None:
+                # TP mode: separate q/k/v projections from split qkv_proj
+                # Use MultiLinear batching for small sequences (same pattern as Attention)
+                dim = x.shape[-1]
+
+                if self.multi_qk is not None and bsz * seqlen <= 32:
+                    x_flat = x.view(1, bsz * seqlen, dim)
+                    qkh = torch.empty((2, bsz * seqlen, dim), dtype=torch.half, device=x.device)
+                    qk = torch.empty((2, bsz * seqlen, self.num_k_heads * self.k_head_dim), dtype=torch.float, device=x.device)
+                    ext.exl3_mgemm(
+                        x_flat, self.multi_qk.ptrs_trellis, qk,
+                        self.multi_qk.ptrs_suh, qkh, self.multi_qk.ptrs_svh,
+                        None, None, self.multi_qk.K, -1,
+                        self.multi_qk.mcg, self.multi_qk.mul1, -1, -1, 0
+                    )
+                    q = qk[0].view(bsz, seqlen, self.num_k_heads * self.k_head_dim)
+                    k = qk[1].view(bsz, seqlen, self.num_k_heads * self.k_head_dim)
+                else:
+                    q = self.q_proj_tp.forward(x, params)
+                    k = self.k_proj_tp.forward(x, params)
+
+                if self.multi_vz is not None and bsz * seqlen <= 32:
+                    x_flat = x.view(1, bsz * seqlen, dim)
+                    vzh = torch.empty((2, bsz * seqlen, dim), dtype=torch.half, device=x.device)
+                    vz = torch.empty((2, bsz * seqlen, self.num_v_heads * self.v_head_dim), dtype=torch.float, device=x.device)
+                    ext.exl3_mgemm(
+                        x_flat, self.multi_vz.ptrs_trellis, vz,
+                        self.multi_vz.ptrs_suh, vzh, self.multi_vz.ptrs_svh,
+                        None, None, self.multi_vz.K, -1,
+                        self.multi_vz.mcg, self.multi_vz.mul1, -1, -1, 0
+                    )
+                    v = vz[0].view(bsz, seqlen, self.num_v_heads * self.v_head_dim)
+                    z = vz[1].view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
+                else:
+                    v = self.v_proj_tp.forward(x, params)
+                    z = self.z_proj.forward(x, params).view(bsz, seqlen, self.num_v_heads, self.v_head_dim)
+
+                b = self.b_proj.forward(x, params)
+                a = self.a_proj.forward(x, params)
+
+                mixed_qkv = torch.cat([q, k, v], dim = -1).transpose(1, 2).to(torch.bfloat16).contiguous()
+
+                beta = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.bfloat16, device = self.device)
+                g = torch.empty((bsz, seqlen, self.num_v_heads), dtype = torch.float, device = self.device)
+
+                ext.gated_delta_net_fused_op_2(
+                    b, a,
+                    self.dt_bias,
+                    self.a_log,
+                    beta, g,
+                    self.beta_scale
+                )
+            elif self.qkvz_proj is not None and self.ba_proj is not None:
                 qkvz = self.qkvz_proj.forward(x, params)
                 ba = self.ba_proj.forward(x, params)
 
@@ -737,14 +811,23 @@ class GatedDeltaNet(Module):
             # Output projection
             x = self.o_proj.forward(core_attn_out, params)
 
+            # TP all-reduce on row-parallel output
+            if self.tp_reduce:
+                params["backend"].all_reduce(x)
+
         # Update cache
         if save_state:
-            rs.last_recurrent_state = recurrent_state
-            rs.last_conv_state = conv_state
-            if not rs.batched:
-                rs.position += seqlen
+            if self.tp_mode:
+                # Store in module-local state (persists in each TP worker)
+                self._tp_recurrent_state = recurrent_state
+                self._tp_conv_state = conv_state
             else:
-                rs.positions = [r + seqlen for r in rs.positions]
+                rs.last_recurrent_state = recurrent_state
+                rs.last_conv_state = conv_state
+                if not rs.batched:
+                    rs.position += seqlen
+                else:
+                    rs.positions = [r + seqlen for r in rs.positions]
 
         return to2(x, out_dtype, self.out_dtype)
 
@@ -768,13 +851,347 @@ class GatedDeltaNet(Module):
 
 
     def make_tp_allocation(self, options: dict) -> list[TPAllocation]:
-        raise NotImplementedError()
+        storage = 0
+        for proj in [self.qkvz_proj, self.qkv_proj, self.z_proj, self.ba_proj,
+                     self.b_proj, self.a_proj, self.o_proj]:
+            if proj is not None:
+                storage += proj.storage_size()
+
+        # Raw tensor storage (a_log, dt_bias, conv1d) — from config since not loaded yet
+        stc = self.config.stc
+        for tensor_key in [self.key_a_log, self.key_dt_bias,
+                           self.key_conv1d_weight, self.key_conv1d_bias,
+                           self.key_conv1d_q_weight, self.key_conv1d_k_weight,
+                           self.key_conv1d_v_weight]:
+            if tensor_key:
+                storage += stc.get_tensor_size(tensor_key, optional=True)
+        # Norm weight storage (prefix-based: "...norm" → "...norm.weight")
+        storage += sum(stc.get_tensor_sizes(self.norm.key))
+
+        # Per-device overhead (residual stream)
+        overhead_d = self.hidden_size * (self.out_dtype or torch.half).itemsize
+
+        # Per-sequence overhead (intermediate tensors proportional to local heads)
+        overhead_s = 0
+        overhead_s += 2 * self.num_k_heads * self.k_head_dim * torch.bfloat16.itemsize  # q, k
+        overhead_s += 2 * self.num_v_heads * self.v_head_dim * torch.bfloat16.itemsize  # v, z
+        overhead_s += 2 * self.num_v_heads * torch.float.itemsize  # beta, g
+        # Recurrent state per sequence
+        overhead_s += self.num_v_heads * self.k_head_dim * self.v_head_dim * torch.float.itemsize
+
+        # Reconstruction temp
+        recons = 0
+        for proj in [self.qkvz_proj, self.qkv_proj, self.z_proj, self.ba_proj,
+                     self.b_proj, self.a_proj, self.o_proj]:
+            if proj is not None:
+                recons = max(recons, proj.recons_size())
+
+        # Channel calculation: split on k_heads, respecting 128-column alignment
+        channel_width = 1
+        channels_to_split = self.num_k_heads
+        while channel_width * self.k_head_dim < 128:
+            assert channels_to_split % 2 == 0, \
+                "Model's K heads cannot divide into 128-channel tensors"
+            channel_width *= 2
+            channels_to_split //= 2
+
+        tpa = TPAllocation(
+            key = self.key,
+            channel_width = channel_width,
+            channel_unit = "heads",
+            storage_per_device = 0,
+            storage_to_split = storage,
+            overhead_per_device = overhead_d,
+            overhead_to_split = overhead_s,
+            recons_temp = recons,
+            channels_to_split = channels_to_split,
+            limit_key = "gdn"
+        )
+        return [tpa]
 
 
     def tp_export(self, plan, producer):
-        raise NotImplementedError()
+        assert self.device is not None, "Cannot export module for TP before loading."
+
+        def _export(child):
+            nonlocal producer
+            return child.tp_export(plan, producer) if child is not None else None
+
+        # Fuse split conv1d weights if they exist (matching what forward() does lazily)
+        conv1d_w = self.conv1d_weight
+        if conv1d_w is None and self.conv1d_q_weight is not None:
+            conv1d_w = torch.cat([
+                self.conv1d_q_weight, self.conv1d_k_weight, self.conv1d_v_weight
+            ], dim=0)
+
+        return {
+            "cls": GatedDeltaNet,
+            "kwargs": {
+                "key": self.key,
+                "layer_idx": self.layer_idx,
+                "hidden_size": self.hidden_size,
+                "k_head_dim": self.k_head_dim,
+                "v_head_dim": self.v_head_dim,
+                "num_k_heads": self.num_k_heads,
+                "num_v_heads": self.num_v_heads,
+                "num_v_groups": self.num_v_groups,
+                "rms_norm_eps": self.rms_norm_eps,
+                "conv_kernel_size": self.conv_kernel_size,
+                "beta_scale": self.beta_scale,
+                "out_dtype": self.out_dtype,
+            },
+            # Projection submodules
+            "qkvz_proj": _export(self.qkvz_proj),
+            "qkv_proj": _export(self.qkv_proj),
+            "z_proj": _export(self.z_proj),
+            "ba_proj": _export(self.ba_proj),
+            "b_proj": _export(self.b_proj),
+            "a_proj": _export(self.a_proj),
+            "o_proj": _export(self.o_proj),
+            "norm": _export(self.norm),
+            # Raw tensors
+            "a_log": producer.send(self.a_log),
+            "dt_bias": producer.send(self.dt_bias),
+            "conv1d_weight": producer.send(conv1d_w),
+            "conv1d_bias": producer.send(self.conv1d_bias),
+            "device": self.device,
+            # Layout info for import
+            "has_fused_qkvz": self.qkvz_proj is not None,
+            "has_split_qkv": self.qkv_proj is not None,
+            "has_fused_ba": self.ba_proj is not None,
+            "has_split_ba": self.b_proj is not None,
+        }
 
 
     @staticmethod
     def tp_import(local_context, exported, plan, **kwargs):
-        raise NotImplementedError()
+        consumer = local_context["consumer"]
+        device = local_context["device"]
+        kw = exported["kwargs"]
+        key = kw["key"]
+
+        # Head assignment from plan: (first_kh, last_kh, "heads") in k_head units
+        first_kh, last_kh, unit = plan[key]
+        assert unit == "heads"
+
+        num_v_groups = kw["num_v_groups"]
+        k_head_dim = kw["k_head_dim"]
+        v_head_dim = kw["v_head_dim"]
+        orig_num_k_heads = kw["num_k_heads"]
+        orig_num_v_heads = kw["num_v_heads"]
+
+        local_num_k_heads = last_kh - first_kh
+        first_vh = first_kh * num_v_groups
+        last_vh = last_kh * num_v_groups
+        local_num_v_heads = local_num_k_heads * num_v_groups
+
+        k_dim = orig_num_k_heads * k_head_dim
+        v_dim = orig_num_v_heads * v_head_dim
+
+        # --- Helper to import a Linear with a specific output-dim split ---
+        def _import_split(name, split):
+            if not exported.get(name):
+                return None
+            return exported[name]["cls"].tp_import_split(
+                local_context, exported[name], plan, split
+            )
+
+        def _import(name):
+            if not exported.get(name):
+                return None
+            return exported[name]["cls"].tp_import(
+                local_context, exported[name], plan
+            )
+
+        # --- Split projections ---
+        # For split qkv layout: output = [q(k_dim), k(k_dim), v(v_dim)]
+        if exported["has_split_qkv"]:
+            q_split = (True, first_kh * k_head_dim, last_kh * k_head_dim)
+            k_split = (True, k_dim + first_kh * k_head_dim, k_dim + last_kh * k_head_dim)
+            v_split = (True, 2 * k_dim + first_vh * v_head_dim, 2 * k_dim + last_vh * v_head_dim)
+            q_proj_tp = _import_split("qkv_proj", q_split)
+            k_proj_tp = _import_split("qkv_proj", k_split)
+            v_proj_tp = _import_split("qkv_proj", v_split)
+            qkvz_proj = None
+            qkv_proj = None
+        elif exported["has_fused_qkvz"]:
+            # Fused qkvz: output layout is interleaved by k_head groups
+            # [k_head_dim, k_head_dim, num_v_groups*v_head_dim, num_v_groups*v_head_dim] per k_head
+            per_kh = 2 * k_head_dim + 2 * num_v_groups * v_head_dim
+            qkvz_split = (True, first_kh * per_kh, last_kh * per_kh)
+            qkvz_proj = _import_split("qkvz_proj", qkvz_split)
+            qkv_proj = None
+            q_proj_tp = None
+            k_proj_tp = None
+            v_proj_tp = None
+        else:
+            raise ValueError("GatedDeltaNet has neither split nor fused qkv projection")
+
+        # z_proj: output = v_dim
+        if exported["has_split_qkv"]:
+            z_split = (True, first_vh * v_head_dim, last_vh * v_head_dim)
+            z_proj = _import_split("z_proj", z_split)
+        else:
+            z_proj = None
+
+        # b/a projections: output = num_v_heads
+        if exported["has_split_ba"]:
+            ba_v_split = (True, first_vh, last_vh)
+            b_proj = _import_split("b_proj", ba_v_split)
+            a_proj = _import_split("a_proj", ba_v_split)
+            ba_proj = None
+        elif exported["has_fused_ba"]:
+            # Fused ba: output = 2 * num_v_heads, interleaved per k_head
+            per_kh_ba = 2 * num_v_groups
+            ba_split = (True, first_kh * per_kh_ba, last_kh * per_kh_ba)
+            ba_proj = _import_split("ba_proj", ba_split)
+            b_proj = None
+            a_proj = None
+        else:
+            ba_proj = None
+            b_proj = None
+            a_proj = None
+
+        # o_proj: input = v_dim (row-parallel split)
+        o_split = (False, first_vh * v_head_dim, last_vh * v_head_dim)
+        o_proj = _import_split("o_proj", o_split)
+
+        # Norm: weight is [v_head_dim] — shared across all v_heads, so replicate (don't split)
+        if exported.get("norm"):
+            norm = exported["norm"]["cls"].tp_import(
+                local_context, exported["norm"], plan
+            )
+        else:
+            norm = None
+
+        # --- Raw tensors: slice by local head ranges ---
+        a_log_full = consumer.recv(exported["a_log"], cuda=True)
+        dt_bias_full = consumer.recv(exported["dt_bias"], cuda=True)
+
+        # a_log and dt_bias are per v_head
+        a_log = a_log_full[first_vh:last_vh].contiguous()
+        dt_bias = dt_bias_full[first_vh:last_vh].contiguous()
+
+        # conv1d_weight: shape [fdim_qkv, 1, kernel_size]
+        # fdim_qkv layout: [q(k_dim), k(k_dim), v(v_dim)]
+        conv1d_w_full = consumer.recv(exported["conv1d_weight"], cuda=True)
+        conv1d_b_full = consumer.recv(exported["conv1d_bias"], cuda=True)
+
+        if conv1d_w_full is not None:
+            q_range = slice(first_kh * k_head_dim, last_kh * k_head_dim)
+            k_range = slice(k_dim + first_kh * k_head_dim, k_dim + last_kh * k_head_dim)
+            v_range = slice(2 * k_dim + first_vh * v_head_dim, 2 * k_dim + last_vh * v_head_dim)
+            conv1d_weight = torch.cat([
+                conv1d_w_full[q_range], conv1d_w_full[k_range], conv1d_w_full[v_range]
+            ], dim=0).contiguous()
+            conv1d_bias = torch.cat([
+                conv1d_b_full[q_range], conv1d_b_full[k_range], conv1d_b_full[v_range]
+            ], dim=0).contiguous() if conv1d_b_full is not None else None
+        else:
+            conv1d_weight = None
+            conv1d_bias = None
+
+        # --- Construct the TP module ---
+        # Use __new__ to avoid constructor's submodule creation from config
+        module = GatedDeltaNet.__new__(GatedDeltaNet)
+        Module.__init__(module, None, key, None)
+        module.module_name = "GatedDeltaNet"
+
+        # Core attributes
+        module.q_priority = 0
+        module.layer_idx = kw["layer_idx"]
+        module.hidden_size = kw["hidden_size"]
+        module.k_head_dim = k_head_dim
+        module.v_head_dim = v_head_dim
+        module.num_k_heads = local_num_k_heads
+        module.num_v_heads = local_num_v_heads
+        module.num_v_groups = num_v_groups
+        module.rms_norm_eps = kw["rms_norm_eps"]
+        module.conv_kernel_size = kw["conv_kernel_size"]
+        module.beta_scale = kw["beta_scale"]
+        module.out_dtype = kw["out_dtype"]
+        module.select_hq_bits = 0
+
+        # Derived dims (local)
+        module.k_dim = k_head_dim * local_num_k_heads
+        module.v_dim = v_head_dim * local_num_v_heads
+        module.fdim_qkvz = 2 * local_num_k_heads * k_head_dim + 2 * local_num_v_heads * v_head_dim
+        module.fdim_ba = 2 * local_num_v_heads
+        module.fdim_qkv = 2 * local_num_k_heads * k_head_dim + local_num_v_heads * v_head_dim
+        module.conv_dim = k_head_dim * local_num_k_heads
+
+        # Assign submodules
+        module.qkvz_proj = qkvz_proj
+        module.qkv_proj = qkv_proj
+        module.z_proj = z_proj
+        module.ba_proj = ba_proj
+        module.b_proj = b_proj
+        module.a_proj = a_proj
+        module.o_proj = o_proj
+        module.norm = norm
+
+        # TP-specific: separate q/k/v projections (for split qkv layout)
+        module.q_proj_tp = q_proj_tp
+        module.k_proj_tp = k_proj_tp
+        module.v_proj_tp = v_proj_tp
+
+        # Raw tensors
+        module.a_log = a_log
+        module.dt_bias = dt_bias
+        module.conv1d_weight = conv1d_weight
+        module.conv1d_bias = conv1d_bias
+        module.conv1d_q_weight = None
+        module.conv1d_k_weight = None
+        module.conv1d_v_weight = None
+
+        # Key strings (not used in TP mode, but forward references them)
+        module.key_a_log = None
+        module.key_dt_bias = None
+        module.key_conv1d_weight = None
+        module.key_conv1d_bias = None
+        module.key_conv1d_q_weight = None
+        module.key_conv1d_k_weight = None
+        module.key_conv1d_v_weight = None
+
+        # TP flags
+        module.tp_reduce = not kwargs.get("skip_reduction", False)
+        module.tp_mode = True
+
+        # Recurrent cache cap
+        module.caps = {"recurrent_cache": True}
+
+        # No C++ fast path in TP mode
+        module.bc = None
+        module.bsz1_pa_args = []
+
+        # Register submodules for iteration
+        module.modules = []
+        for sub in [qkvz_proj, q_proj_tp, k_proj_tp, v_proj_tp, z_proj,
+                     ba_proj, b_proj, a_proj, o_proj, norm]:
+            if sub is not None:
+                module.modules.append(sub)
+
+        module.device = device
+
+        # Try to create MultiLinear for batched q+k projection (same pattern as
+        # Attention's multi_kv). q and k have matching out_features since they
+        # come from the same qkv_proj split on k_heads.
+        module.multi_qk = None
+        if (q_proj_tp is not None and k_proj_tp is not None and
+            q_proj_tp.quant_type == "exl3" and k_proj_tp.quant_type == "exl3" and
+            q_proj_tp.out_features == k_proj_tp.out_features and
+            q_proj_tp.inner.K == k_proj_tp.inner.K and
+            q_proj_tp.inner.bias is None and k_proj_tp.inner.bias is None):
+            module.multi_qk = MultiLinear(device, [q_proj_tp, k_proj_tp])
+
+        # Also try to batch v+z if dimensions match
+        module.multi_vz = None
+        if (v_proj_tp is not None and z_proj is not None and
+            v_proj_tp.quant_type == "exl3" and z_proj.quant_type == "exl3" and
+            v_proj_tp.out_features == z_proj.out_features and
+            v_proj_tp.inner.K == z_proj.inner.K and
+            v_proj_tp.inner.bias is None and z_proj.inner.bias is None):
+            module.multi_vz = MultiLinear(device, [v_proj_tp, z_proj])
+
+        torch.cuda.synchronize()
+        return module
