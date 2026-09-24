@@ -348,6 +348,26 @@ struct BC_GatedDeltaNetSplit
         const at::Tensor& slots,
         bool history
     );
+
+    // Layer-graph protocol (Graph::layer_mode)
+    std::vector<PPTR> args_bszN
+    (
+        const at::Tensor& x,
+        at::Tensor& y,
+        at::Tensor& conv_state,
+        at::Tensor& recurrent_state,
+        const at::Tensor& slots
+    );
+    void run_bszN_layer
+    (
+        const at::Tensor& x,
+        at::Tensor& y,
+        at::Tensor& conv_state,
+        at::Tensor& recurrent_state,
+        const at::Tensor& slots,
+        bool history,
+        std::shared_ptr<Graph> lg
+    );
 };
 
 

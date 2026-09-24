@@ -559,6 +559,7 @@ class BCAttn:
         inv_freq: torch.Tensor | None,
         causal: bool = True,
         host_seqlens: torch.Tensor | None = None,
+        layer_graph = None,
     ) -> torch.Tensor | None:
         bsz, q_len, _ = x.shape
 
@@ -589,8 +590,12 @@ class BCAttn:
             self._configure(bsz, q_len, causal, regime)
             self.slot_widths[(bsz, q_len, regime)] = skey
         y = torch.empty((bsz, q_len, self.hidden_size), dtype = self.o_dtype, device = x.device)
-        self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
-                    position_ids, inv_freq, regime, t_total)
+        if layer_graph is not None:
+            self.bc.run_layer(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
+                              position_ids, inv_freq, regime, t_total, layer_graph)
+        else:
+            self.bc.run(bsz, q_len, x, y, cache_seqlens, block_table, position, positions,
+                        position_ids, inv_freq, regime, t_total)
         return y
 
 

@@ -351,6 +351,41 @@ struct BC_Attention
         Graph* graph
     );
 
+    // Layer-graph protocol (Graph::layer_mode)
+    std::vector<PPTR> build_args
+    (
+        int bsz,
+        int q_len,
+        Slot& s,
+        const at::Tensor& x,
+        at::Tensor& y,
+        const at::Tensor& cache_seqlens,
+        const at::Tensor& block_table,
+        int64_t position,
+        const c10::optional<at::Tensor>& positions,
+        const c10::optional<at::Tensor>& position_ids,
+        const c10::optional<at::Tensor>& inv_freq_override,
+        int regime,
+        int64_t t_total
+    );
+
+    void run_layer
+    (
+        int bsz,
+        int q_len,
+        const at::Tensor& x,
+        at::Tensor& y,
+        const at::Tensor& cache_seqlens,
+        const at::Tensor& block_table,
+        int64_t position,
+        const c10::optional<at::Tensor>& positions,
+        const c10::optional<at::Tensor>& position_ids,
+        const c10::optional<at::Tensor>& inv_freq_override,
+        int regime,
+        int64_t t_total,
+        std::shared_ptr<Graph> lg
+    );
+
 private:
     Slot& slot(int bsz, int q_len, int regime)
         { return slots[(regime * MAX_BSZ + bsz - 1) * MAX_QLEN + (q_len - 1)]; }

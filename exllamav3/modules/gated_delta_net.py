@@ -1071,7 +1071,11 @@ class GatedDeltaNet(Module):
                 else:
                     self._bc_configure_slot(bsz, seqlen, save_history)
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
-            self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
+            lg = params.get("layer_graph")
+            if lg is not None:
+                self.bc.run_bszN_layer(x, y, conv_state, recurrent_state, recurrent_slots, save_history, lg)
+            else:
+                self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
             if self.tp_reduce:
                 self.tp_collect(params["backend"], y, final = True)
             return to2(y, out_dtype, self.out_dtype)

@@ -19,6 +19,15 @@ Graph::Graph()
     graph = NULL;
     graph_exec = NULL;
     need_cublas = false;
+    layer_mode = 0;
+    stage_hits = 0;
+}
+
+void Graph::launch_pending()
+{
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    launch(pending, stream);
+    pending.clear();
 }
 
 Graph::~Graph()

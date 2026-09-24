@@ -840,10 +840,11 @@ void BC_Attention::run_gr
         copy2d_gr(c2, y2, graph);
 }
 
-void BC_Attention::run
+std::vector<PPTR> BC_Attention::build_args
 (
     int bsz,
     int q_len,
+    Slot& s,
     const at::Tensor& x,
     at::Tensor& y,
     const at::Tensor& cache_seqlens,
@@ -856,32 +857,6 @@ void BC_Attention::run
     int64_t t_total
 )
 {
-    py::gil_scoped_release release;
-    c10::cuda::CUDAGuard device_guard(x.device());
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
-
-    Slot& s = slot(bsz, q_len, regime);
-    TORCH_CHECK(s.configured, "BC_Attention: slot not configured");
-    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "BC_Attention: x and y must be contiguous");
-    TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
-
-    // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
-    // captured, then launched below like every later run, with only the I/O pointers patched
-    if (s.runs == 0)
-    {
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
-        s.runs = 1;
-        return;
-    }
-
-    if (!s.graph->ready)
-    {
-        s.graph->capture_begin();
-        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get());
-        s.graph->capture_end();
-        s.runs = 2;
-    }
-
     int R = bsz * q_len;
     bool use_mgemm = kv_ptrs_trellis.has_value() && (R <= 32 || !k_proj);
     bool use_qg_mgemm = gate_mode == 2 && qg_ptrs_trellis.has_value() && R <= 32;
@@ -1014,5 +989,85 @@ void BC_Attention::run
     }
     if (padded)
         params.emplace_back(GP_copy2d_dst, (void*) y.data_ptr());
+    return params;
+}
+
+void BC_Attention::run_layer
+(
+    int bsz,
+    int q_len,
+    const at::Tensor& x,
+    at::Tensor& y,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int64_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    const c10::optional<at::Tensor>& inv_freq_override,
+    int regime,
+    int64_t t_total,
+    std::shared_ptr<Graph> lg
+)
+{
+    py::gil_scoped_release release;
+    c10::cuda::CUDAGuard device_guard(x.device());
+    Slot& s = slot(bsz, q_len, regime);
+    TORCH_CHECK(s.configured, "BC_Attention: slot not configured");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "BC_Attention: x and y must be contiguous");
+    TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
+    lg->stage_hits++;
+    if (lg->capturing() || lg->replaying())
+    {
+        auto a = build_args(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total);
+        lg->pending.insert(lg->pending.end(), a.begin(), a.end());
+        if (lg->replaying()) return;
+    }
+    run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total,
+           lg->capturing() ? lg.get() : nullptr);
+}
+
+void BC_Attention::run
+(
+    int bsz,
+    int q_len,
+    const at::Tensor& x,
+    at::Tensor& y,
+    const at::Tensor& cache_seqlens,
+    const at::Tensor& block_table,
+    int64_t position,
+    const c10::optional<at::Tensor>& positions,
+    const c10::optional<at::Tensor>& position_ids,
+    const c10::optional<at::Tensor>& inv_freq_override,
+    int regime,
+    int64_t t_total
+)
+{
+    py::gil_scoped_release release;
+    c10::cuda::CUDAGuard device_guard(x.device());
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+
+    Slot& s = slot(bsz, q_len, regime);
+    TORCH_CHECK(s.configured, "BC_Attention: slot not configured");
+    TORCH_CHECK(x.is_contiguous() && y.is_contiguous(), "BC_Attention: x and y must be contiguous");
+    TORCH_CHECK(regime == 0 || qsa, "BC_Attention: sparse regime without QSA indexer");
+
+    // First run per slot executes eagerly (GEMM autotune, kernel warmup); the second run is
+    // captured, then launched below like every later run, with only the I/O pointers patched
+    if (s.runs == 0)
+    {
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, nullptr);
+        s.runs = 1;
+        return;
+    }
+
+    if (!s.graph->ready)
+    {
+        s.graph->capture_begin();
+        run_gr(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total, s.graph.get());
+        s.graph->capture_end();
+        s.runs = 2;
+    }
+
+    std::vector<PPTR> params = build_args(bsz, q_len, s, x, y, cache_seqlens, block_table, position, positions, position_ids, inv_freq_override, regime, t_total);
     s.graph->launch(params, stream);
 }

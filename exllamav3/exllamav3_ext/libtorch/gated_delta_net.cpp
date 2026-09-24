@@ -323,6 +323,92 @@ void BC_GatedDeltaNetSplit::run_bszN_gr
         add_gr(y, o_proj->bias.value(), y, graph);
 }
 
+std::vector<PPTR> BC_GatedDeltaNetSplit::args_bszN
+(
+    const at::Tensor& x,
+    at::Tensor& y,
+    at::Tensor& conv_state,
+    at::Tensor& recurrent_state,
+    const at::Tensor& slots
+)
+{
+    std::vector<PPTR> args;
+    if (kda)
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // b_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // f_a input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // g_a input
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
+    else if (qkvz_ptrs_trellis.has_value() && (int) (x.size(0) * x.size(1)) <= 32)
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_mgemm_A,        (void*) x.data_ptr()),          // sliced qkv+z bundle input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
+    else
+        args = std::vector<PPTR>
+        {
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
+            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // z_proj input
+            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
+            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
+            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
+            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
+            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
+            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
+        };
+    return args;
+}
+
+void BC_GatedDeltaNetSplit::run_bszN_layer
+(
+    const at::Tensor& x,
+    at::Tensor& y,
+    at::Tensor& conv_state,
+    at::Tensor& recurrent_state,
+    const at::Tensor& slots,
+    bool history,
+    std::shared_ptr<Graph> lg
+)
+{
+    py::gil_scoped_release release;
+    c10::cuda::CUDAGuard device_guard(x.device());
+    int bsz = (int) x.size(0);
+    int seqlen = (int) x.size(1);
+    TORCH_CHECK(bsz >= 1 && bsz <= MAX_BSZ && seqlen >= 1 && seqlen <= MAX_QLEN,
+                "BC_GatedDeltaNetSplit::run_bszN_layer: shape out of range");
+    Slot& s = slot(bsz, seqlen, history);
+    TORCH_CHECK(s.configured, "BC_GatedDeltaNetSplit::run_bszN_layer: slot not configured");
+    lg->stage_hits++;
+    if (lg->capturing())
+    {
+        s.graph_state_size = (int) conv_state.size(2);
+        s.graph_hist_stride = (int) recurrent_state.size(1);
+    }
+    if (lg->capturing() || lg->replaying())
+    {
+        // The captured graph baked in the state-buffer geometry (scalar kernel arguments)
+        TORCH_CHECK((int) conv_state.size(2) == s.graph_state_size && (int) recurrent_state.size(1) == s.graph_hist_stride,
+                    "BC_GatedDeltaNetSplit::run_bszN_layer: state geometry changed since capture");
+        auto a = args_bszN(x, y, conv_state, recurrent_state, slots);
+        lg->pending.insert(lg->pending.end(), a.begin(), a.end());
+        if (lg->replaying()) return;
+    }
+    run_bszN_gr(x, y, conv_state, recurrent_state, slots, history, s, lg->capturing() ? lg.get() : nullptr);
+}
+
 void BC_GatedDeltaNetSplit::run_bszN
 (
     const at::Tensor& x,
@@ -370,43 +456,7 @@ void BC_GatedDeltaNetSplit::run_bszN
         s.graph->capture_end();
     }
 
-    std::vector<PPTR> args;
-    if (kda)
-        args = std::vector<PPTR>
-        {
-            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // b_proj input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // f_a input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),          // g_a input
-            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
-            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
-            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
-            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
-        };
-    else if (qkvz_ptrs_trellis.has_value() && (int) (x.size(0) * x.size(1)) <= 32)
-        args = std::vector<PPTR>
-        {
-            PPTR(GP_mgemm_A,        (void*) x.data_ptr()),          // sliced qkv+z bundle input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
-            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
-            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
-            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
-            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
-        };
-    else
-        args = std::vector<PPTR>
-        {
-            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // qkv_proj input
-            PPTR(GP_gemm_A,         (void*) x.data_ptr()),          // z_proj input
-            PPTR(GP_gdn_ba_x,       (void*) x.data_ptr()),
-            PPTR(GP_conv1d_state,   (void*) conv_state.data_ptr()),
-            PPTR(GP_conv1d_slots,   (void*) slots.data_ptr()),
-            PPTR(GP_gdn_rule_state, (void*) recurrent_state.data_ptr()),
-            PPTR(GP_gdn_rule_slots, (void*) slots.data_ptr()),
-            PPTR(GP_gemm_C,         (void*) y.data_ptr())           // o_proj output
-        };
+    std::vector<PPTR> args = args_bszN(x, y, conv_state, recurrent_state, slots);
     s.graph->launch(args, stream);
 }
 

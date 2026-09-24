@@ -112,6 +112,18 @@ class RMSNorm(Module):
         residual_in: torch.Tensor | None = None,
     ) -> torch.Tensor:
         dtype = out_dtype or self.out_dtype
+        lg = params.get("layer_graph")
+        # Layer graph (see TransformerBlock.forward): the plain weighted norm records into / replays through
+        # the block's graph. Anything else on this path would be a stage the block cannot replay, so it
+        # deliberately does not take lg and leaves the block's stage count short
+        if (
+            lg is not None and residual is None and residual_in is None and not self.span_heads and
+            self.groups == 1 and self.weight is not None and x.is_contiguous()
+        ):
+            x_2d = x.view(-1, x.shape[-1])
+            y_2d = torch.empty_like(x_2d, dtype = dtype)
+            ext.rms_norm_layer(x_2d, self.weight, y_2d, self.rms_norm_eps, self.constant_bias, self.constant_scale, lg)
+            return y_2d.view(x.shape)
 
         # Fused pre-norm residual: residual_in += x (in place), y = norm(residual_in)
         if residual_in is not None:

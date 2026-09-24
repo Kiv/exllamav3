@@ -9,6 +9,7 @@
 #include "hadamard.h"
 
 #include "norm.cuh"
+#include "graph.cuh"
 #include "hgemm.cuh"
 #include "rope.cuh"
 #include "activation.cuh"
@@ -80,6 +81,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("stloader_read", &stloader_read, "stloader_read");
     m.def("stloader_open_file", &stloader_open_file, "stloader_open_file");
     m.def("stloader_close_file", &stloader_close_file, "stloader_close_file");
+    py::class_<Graph, std::shared_ptr<Graph>>(m, "Graph")
+        .def(py::init<>())
+        .def("capture_begin", [] (Graph& g) { g.layer_mode = 1; g.capture_begin(); })
+        .def("capture_end", [] (Graph& g) { g.capture_end(); g.layer_mode = 2; })
+        .def("launch_pending", &Graph::launch_pending)
+        .def_readwrite("layer_mode", &Graph::layer_mode)
+        .def_readwrite("stage_hits", &Graph::stage_hits)
+        .def_readonly("ready", &Graph::ready);
+
     py::class_<TensorLoadJob>(m, "TensorLoadJob")
         .def(py::init<std::vector<uintptr_t>, size_t, size_t, uintptr_t, size_t, bool, bool, bool, int>());
     m.def("stloader_deferred_cpu", &stloader_deferred_cpu, py::arg("jobs"));
@@ -96,6 +106,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         py::arg("constant_bias"), py::arg("constant_scale"), py::arg("span_heads"),
         py::arg("add_residual"), py::arg("w_groups") = 1);
     m.def("rms_norm_res_in", &rms_norm_res_in, "rms_norm_res_in");
+    m.def("rms_norm_layer", &rms_norm_layer, "rms_norm_layer");
     m.def("gated_rms_norm", &gated_rms_norm, "gated_rms_norm");
     m.def("softcap", &softcap, "softcap");
 
@@ -142,6 +153,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
     m.def("pg_all_reduce_p2p", &pg_all_reduce_p2p, "pg_all_reduce_p2p");
     m.def("pg_all_reduce_p2p_fused", &pg_all_reduce_p2p_fused, "pg_all_reduce_p2p_fused");
+    m.def("pg_all_reduce_p2p_fused_layer", &pg_all_reduce_p2p_fused_layer, "pg_all_reduce_p2p_fused_layer");
     m.def("pg_p2p_arena_size", &pg_p2p_arena_size, "pg_p2p_arena_size");
     m.def("pg_p2p_arena_create", &pg_p2p_arena_create, "pg_p2p_arena_create");
     m.def("pg_p2p_arena_free", &pg_p2p_arena_free, "pg_p2p_arena_free");

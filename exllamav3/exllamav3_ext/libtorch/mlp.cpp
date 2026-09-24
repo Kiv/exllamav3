@@ -90,6 +90,59 @@ void BC_GatedMLP::run_bszN_gr
         add_gr(d, down->bias.value(), d, graph);
 }
 
+std::vector<PPTR> BC_GatedMLP::args_bszN
+(
+    const at::Tensor& x,
+    at::Tensor& d
+)
+{
+    int num_tokens = (int) x.numel() / (int) x.size(-1);
+    std::vector<PPTR> args;
+    if (gu_ptrs_trellis)
+    {
+        args.emplace_back(GP_mgemm_A, (void*) x.data_ptr());
+    }
+    else
+    {
+        at::Tensor gu_n = gu_cache[num_tokens - 1];
+        // The gate/up GEMMs record their own GP_gemm_C sites ahead of the down projection's;
+        // patch them with their (static) values so the site walk stays aligned and the final
+        // GP_gemm_C entry binds to the down projection
+        args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+        args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
+        args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+        args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
+    }
+    args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
+    if (down->bias)
+    {
+        args.emplace_back(GP_add_x, (void*) d.data_ptr());
+        args.emplace_back(GP_add_z, (void*) d.data_ptr());
+    }
+
+    return args;
+}
+
+void BC_GatedMLP::run_bszN_layer
+(
+    const at::Tensor& x,
+    at::Tensor& d,
+    std::shared_ptr<Graph> lg
+)
+{
+    int num_tokens = (int) x.numel() / (int) x.size(-1);
+    TORCH_CHECK(num_tokens >= 1 && num_tokens <= MAX_BSZN, "run_bszN_layer: bsz out of supported range");
+    c10::cuda::CUDAGuard device_guard(x.device());
+    lg->stage_hits++;
+    if (lg->capturing() || lg->replaying())
+    {
+        auto a = args_bszN(x, d);
+        lg->pending.insert(lg->pending.end(), a.begin(), a.end());
+        if (lg->replaying()) return;
+    }
+    run_bszN_gr(x, d, num_tokens, lg->capturing() ? lg.get() : nullptr);
+}
+
 void BC_GatedMLP::run_bszN
 (
     const at::Tensor& x,
@@ -119,29 +172,7 @@ void BC_GatedMLP::run_bszN
             g.capture_end();
         }
 
-        std::vector<PPTR> args;
-        if (gu_ptrs_trellis)
-        {
-            args.emplace_back(GP_mgemm_A, (void*) x.data_ptr());
-        }
-        else
-        {
-            at::Tensor gu_n = gu_cache[num_tokens - 1];
-            // The gate/up GEMMs record their own GP_gemm_C sites ahead of the down projection's;
-            // patch them with their (static) values so the site walk stays aligned and the final
-            // GP_gemm_C entry binds to the down projection
-            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
-            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 0).data_ptr());
-            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
-            args.emplace_back(GP_gemm_C, (void*) gu_n.select(0, 1).data_ptr());
-        }
-        args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
-        if (down->bias)
-        {
-            args.emplace_back(GP_add_x, (void*) d.data_ptr());
-            args.emplace_back(GP_add_z, (void*) d.data_ptr());
-        }
-
+        std::vector<PPTR> args = args_bszN(x, d);
         g.launch(args, stream);
     }
 }
@@ -185,6 +216,60 @@ void BC_MLP::run_bsz1_gr
         down->run_gr(u, d, graph);
 }
 
+std::vector<PPTR> BC_MLP::args_bsz1
+(
+    const at::Tensor& x,
+    at::Tensor& d
+)
+{
+    std::vector<PPTR> args;
+    // Intermediate same-type sites (the head staging copy's dst, the up projection's C) are
+    // patched with their static values to keep the site walk aligned
+    if (xp)
+    {
+        args.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
+        args.emplace_back(GP_copy2d_dst, (void*) xp.value().data_ptr());
+    }
+    else
+        args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
+    args.emplace_back(GP_gemm_C, (void*) u.data_ptr());
+    if (yp)
+    {
+        args.emplace_back(GP_copy2d_src, (void*) yp.value().data_ptr());
+        args.emplace_back(GP_copy2d_dst, (void*) d.data_ptr());
+    }
+    else
+    {
+        args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
+        if (down->bias)
+        {
+            args.emplace_back(GP_add_x, (void*) d.data_ptr());
+            args.emplace_back(GP_add_z, (void*) d.data_ptr());
+        }
+    }
+
+    return args;
+}
+
+void BC_MLP::run_bsz1_layer
+(
+    const at::Tensor& x,
+    at::Tensor& d,
+    std::shared_ptr<Graph> lg
+)
+{
+    py::gil_scoped_release release;
+    c10::cuda::CUDAGuard device_guard(x.device());
+    lg->stage_hits++;
+    if (lg->capturing() || lg->replaying())
+    {
+        auto a = args_bsz1(x, d);
+        lg->pending.insert(lg->pending.end(), a.begin(), a.end());
+        if (lg->replaying()) return;
+    }
+    run_bsz1_gr(x, d, lg->capturing() ? lg.get() : nullptr);
+}
+
 void BC_MLP::run_bsz1
 (
     const at::Tensor& x,
@@ -208,32 +293,7 @@ void BC_MLP::run_bsz1
             graph_bsz1.capture_end();
         }
 
-        std::vector<PPTR> args;
-        // Intermediate same-type sites (the head staging copy's dst, the up projection's C) are
-        // patched with their static values to keep the site walk aligned
-        if (xp)
-        {
-            args.emplace_back(GP_copy2d_src, (void*) x.data_ptr());
-            args.emplace_back(GP_copy2d_dst, (void*) xp.value().data_ptr());
-        }
-        else
-            args.emplace_back(GP_gemm_A, (void*) x.data_ptr());
-        args.emplace_back(GP_gemm_C, (void*) u.data_ptr());
-        if (yp)
-        {
-            args.emplace_back(GP_copy2d_src, (void*) yp.value().data_ptr());
-            args.emplace_back(GP_copy2d_dst, (void*) d.data_ptr());
-        }
-        else
-        {
-            args.emplace_back(GP_gemm_C, (void*) d.data_ptr());
-            if (down->bias)
-            {
-                args.emplace_back(GP_add_x, (void*) d.data_ptr());
-                args.emplace_back(GP_add_z, (void*) d.data_ptr());
-            }
-        }
-
+        std::vector<PPTR> args = args_bsz1(x, d);
         graph_bsz1.launch(args, stream);
     }
 }

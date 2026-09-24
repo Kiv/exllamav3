@@ -724,6 +724,16 @@ MLP reduce with `x += y` (decode-sized rows only). The fused kernel runs the sam
 `rms_norm_res_in` arithmetic, so outputs are unchanged. Set to `1` to run the reduce and the epilogue
 as separate kernels, for A/B comparison.
 
+### `EXL3_TP_P2P_NO_GRAPH` (default: `0`)
+
+`p2p` backend only. With the fused reduce active, each transformer block captures its decode step (input
+norm, attention or GDN block, fused reduce + residual + MLP norm, MLP block, fused reduce + residual) as one
+CUDA graph per shape and replays it with the per-step pointers patched, in place of the sublayers' own
+per-block graphs plus the eager kernels between them. The first call of a shape runs eagerly and checks that
+every stage went through a graph-aware path; shapes that do not (prefill, python attention paths,
+hyperconnections, post-norms, ...) stay eager. Set to `1` to keep the per-block graphs and eager epilogues
+instead, for A/B comparison. Outputs are unchanged either way.
+
 ### `EXL3_TP_P2P_FP32` (default: `0`)
 
 `p2p` backend only: reduce fp32 payloads over an exact fp32 wire instead of the bf16 wire the native backend
