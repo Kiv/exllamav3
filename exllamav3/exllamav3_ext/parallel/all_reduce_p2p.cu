@@ -10,6 +10,7 @@
 #include "timeout.cuh"
 #include "all_reduce_cpu_avx2.h"   // atomic_ref
 #include "../norm_row.cuh"
+#include "../graph.cuh"
 #include <thread>
 #include <chrono>
 #include <cstring>
@@ -634,24 +635,25 @@ void pg_all_reduce_p2p_fused_kernel
 }
 
 
-void pg_all_reduce_p2p_fused
+static void pg_all_reduce_p2p_fused_impl
 (
     uintptr_t ctx,
     uintptr_t ctx_dev,
-    std::vector<uintptr_t> arenas,
-    std::vector<int> devices,
+    std::vector<uintptr_t>& arenas,
+    std::vector<int>& devices,
     int this_rank,
     at::Tensor& tensor,
     at::Tensor& residual,
-    c10::optional<at::Tensor> weight,
-    c10::optional<at::Tensor> out,
+    c10::optional<at::Tensor>& weight,
+    c10::optional<at::Tensor>& out,
     float epsilon,
     float constant_bias,
     float constant_scale,
     int mode,
     size_t slot_size,
     bool fp32_wire,
-    at::Tensor& abort_flag
+    at::Tensor& abort_flag,
+    Graph* graph
 )
 {
     const int num_ranks = (int) devices.size();
@@ -660,7 +662,7 @@ void pg_all_reduce_p2p_fused
     const int this_device = devices[this_rank];
 
     const at::cuda::OptionalCUDAGuard device_guard(this_device);
-    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaStream_t stream = graph ? graph->capture_stream : at::cuda::getCurrentCUDAStream().stream();
     pg_check_timeout(ctx);
 
     const int dim = (int) tensor.size(-1);
@@ -701,9 +703,18 @@ void pg_all_reduce_p2p_fused
     auto to = out.has_value() ? out.value().scalar_type() : at::kHalf;
 
     #define P2P_FLAUNCH(DT, WIRE, MODE, OT, WT, RT) \
-        pg_all_reduce_p2p_fused_kernel<DT, WIRE, MODE, OT, WT, RT><<<rows, threads, 0, stream>>> \
-            (ctx_d, peers, num_ranks, this_rank, data_ptr, (RT*) r_ptr, (const WT*) w_ptr, (OT*) o_ptr, \
-             dim, epsilon, constant_bias, constant_scale, slot_size, abort_flag_ptr)
+        do { \
+            if (graph) \
+            { \
+                void* kfn = (void*) pg_all_reduce_p2p_fused_kernel<DT, WIRE, MODE, OT, WT, RT>; \
+                graph->record_param(kfn, GP_p2p_y, 4); \
+                graph->record_param(kfn, GP_p2p_r, 5); \
+                graph->record_param(kfn, GP_p2p_out, 7); \
+            } \
+            pg_all_reduce_p2p_fused_kernel<DT, WIRE, MODE, OT, WT, RT><<<rows, threads, 0, stream>>> \
+                (ctx_d, peers, num_ranks, this_rank, data_ptr, (RT*) r_ptr, (const WT*) w_ptr, (OT*) o_ptr, \
+                 dim, epsilon, constant_bias, constant_scale, slot_size, abort_flag_ptr); \
+        } while (0)
     #define P2P_FDISPATCH_RT(DT, WIRE, MODE, OT, WT) \
         if (tr == at::kFloat) P2P_FLAUNCH(DT, WIRE, MODE, OT, WT, float); \
         else if (tr == at::kHalf) P2P_FLAUNCH(DT, WIRE, MODE, OT, WT, half); \
@@ -723,4 +734,65 @@ void pg_all_reduce_p2p_fused
     #undef P2P_FDISPATCH_RT
     #undef P2P_FDISPATCH_MODE
     cuda_check(cudaPeekAtLastError());
+}
+
+
+void pg_all_reduce_p2p_fused
+(
+    uintptr_t ctx,
+    uintptr_t ctx_dev,
+    std::vector<uintptr_t> arenas,
+    std::vector<int> devices,
+    int this_rank,
+    at::Tensor& tensor,
+    at::Tensor& residual,
+    c10::optional<at::Tensor> weight,
+    c10::optional<at::Tensor> out,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    int mode,
+    size_t slot_size,
+    bool fp32_wire,
+    at::Tensor& abort_flag
+)
+{
+    pg_all_reduce_p2p_fused_impl(ctx, ctx_dev, arenas, devices, this_rank, tensor, residual, weight, out,
+                                 epsilon, constant_bias, constant_scale, mode, slot_size, fp32_wire, abort_flag, nullptr);
+}
+
+
+// Layer-graph entry (see Graph::layer_mode)
+void pg_all_reduce_p2p_fused_layer
+(
+    uintptr_t ctx,
+    uintptr_t ctx_dev,
+    std::vector<uintptr_t> arenas,
+    std::vector<int> devices,
+    int this_rank,
+    at::Tensor& tensor,
+    at::Tensor& residual,
+    c10::optional<at::Tensor> weight,
+    c10::optional<at::Tensor> out,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    int mode,
+    size_t slot_size,
+    bool fp32_wire,
+    at::Tensor& abort_flag,
+    std::shared_ptr<Graph> graph
+)
+{
+    graph->stage_hits++;
+    if (graph->capturing() || graph->replaying())
+    {
+        graph->pending.emplace_back(GP_p2p_y, (void*) tensor.data_ptr());
+        graph->pending.emplace_back(GP_p2p_r, (void*) residual.data_ptr());
+        graph->pending.emplace_back(GP_p2p_out, out.has_value() ? (void*) out.value().data_ptr() : nullptr);
+        if (graph->replaying()) return;
+    }
+    pg_all_reduce_p2p_fused_impl(ctx, ctx_dev, arenas, devices, this_rank, tensor, residual, weight, out,
+                                 epsilon, constant_bias, constant_scale, mode, slot_size, fp32_wire, abort_flag,
+                                 graph->capturing() ? graph.get() : nullptr);
 }

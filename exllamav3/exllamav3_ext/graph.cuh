@@ -95,7 +95,12 @@ enum GraphedParams
 
     GP_moe_bias_add_sel,
     GP_moe_bias_add_weighted_sel,
-    GP_moe_bias_add_weighted_weights
+    GP_moe_bias_add_weighted_weights,
+    GP_norm_x,
+    GP_norm_y,
+    GP_p2p_y,
+    GP_p2p_r,
+    GP_p2p_out
 };
 
 class Graph
@@ -125,6 +130,14 @@ public:
     bool ready_to_record;
     bool disabled;
 
+    // Layer-graph protocol (Python-driven composition of several block workloads into one graph):
+    // mode 0 = eager warm-up, 1 = capturing (workloads record into this graph), 2 = replay
+    // (workloads append their patched params to `pending` instead of launching; launch_pending()
+    // then patches and launches the whole graph once)
+    int layer_mode;
+    std::vector<PPTR> pending;
+    int stage_hits;   // graph-aware workloads seen during the current pass (eligibility check)
+
     Graph();
     ~Graph();
 
@@ -133,6 +146,10 @@ public:
 
     void record_param(void* kernel, int param_id, int param_offset, int size = 8);
     void launch(std::vector<PPTR> params, cudaStream_t stream);
+    void launch_pending();
+    // True when a workload given this graph should record into it (capture in progress)
+    bool capturing() const { return layer_mode == 1; }
+    bool replaying() const { return layer_mode == 2; }
 
     void inspect_graph();
 };

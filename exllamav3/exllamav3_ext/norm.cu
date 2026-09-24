@@ -159,6 +159,12 @@ void rms_norm_impl
     // Launch macro
     #define __(_tx, __tx, _tw, __tw, _ty, __ty, _res, _tr, __tr)                                   \
     if (tx == at::_tx && tw == at::_tw && ty == at::_ty && res_mode == _res && tr == at::_tr)      \
+    {                                                                                              \
+        if (graph)                                                                                 \
+        {                                                                                          \
+            graph->record_param((void*) rms_norm_kernel<_res, __tx, __ty, __tw, __tr>, GP_norm_x, 0); \
+            graph->record_param((void*) rms_norm_kernel<_res, __tx, __ty, __tw, __tr>, GP_norm_y, 2); \
+        }                                                                                          \
         rms_norm_kernel<_res, __tx, __ty, __tw, __tr><<<gridDim, blockDim, 0, stream>>>            \
         (                                                                                          \
             (const __tx*) x.data_ptr(),                                                            \
@@ -171,7 +177,8 @@ void rms_norm_impl
             constant_bias,                                                          \
             constant_scale,                                                         \
             w_groups                                                                \
-        );
+        );                                                                          \
+    }
 
     //      x_type________ w_type_____________  y_type_______        mode      r_type
          __(kHalf,  half,  kHalf,     half,     kHalf,  half,  RES_NONE, kHalf,  half)
@@ -479,4 +486,29 @@ void gated_rms_norm
 )
 {
     gated_rms_norm_gr(x, w, y, g, epsilon, constant_bias, nullptr, w_groups, gate_first, gate_act);
+}
+
+
+// Layer-graph entry (see Graph::layer_mode): replay appends the patched sites, otherwise the norm runs
+// eagerly or records into the graph being captured. Plain per-channel norm only (no residual modes)
+void rms_norm_layer
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    std::shared_ptr<Graph> graph
+)
+{
+    graph->stage_hits++;
+    if (graph->capturing() || graph->replaying())
+    {
+        graph->pending.emplace_back(GP_norm_x, (void*) x.data_ptr());
+        graph->pending.emplace_back(GP_norm_y, (void*) y.data_ptr());
+        if (graph->replaying()) return;
+    }
+    rms_norm_impl(x, w, y, {}, epsilon, constant_bias, constant_scale, false, RES_NONE,
+                  graph->capturing() ? graph.get() : nullptr);
 }

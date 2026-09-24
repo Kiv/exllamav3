@@ -23,6 +23,7 @@ _no_p2p = os.environ.get("EXL3_TP_NO_P2P", "0") != "0"
 _p2p_trace = os.environ.get("EXL3_TP_P2P_TRACE", "0") != "0"
 _p2p_fp32 = os.environ.get("EXL3_TP_P2P_FP32", "0") != "0"
 _p2p_no_fuse = os.environ.get("EXL3_TP_P2P_NO_FUSE", "0") != "0"
+_p2p_no_graph = os.environ.get("EXL3_TP_P2P_NO_GRAPH", "0") != "0"
 P2P_MAX_FUSED_ROWS = 16
 P2P_SETUP_TIMEOUT_MS = 60000
 # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
@@ -610,6 +611,7 @@ class TPBackendP2P(TPBackendNative):
         # pending_collect instead of reducing (see TransformerBlock.forward)
         self.defer_collect = False
         self.pending_collect = None
+        self.layer_graphs_ok = not _p2p_no_graph
         self.output_device = output_device
         if self.cpu or self.device < 0:
             # The helper process keeps running the CPU reduce loop regardless of the verdict: with P2P active it
@@ -783,7 +785,7 @@ class TPBackendP2P(TPBackendNative):
         return True
 
 
-    def all_reduce_fused(self, y: torch.Tensor, residual: torch.Tensor, norm = None, out_dtype = torch.half):
+    def all_reduce_fused(self, y: torch.Tensor, residual: torch.Tensor, norm = None, out_dtype = torch.half, layer_graph = None):
         """
         Reduce y across ranks and apply the residual epilogue in the same kernel: residual += y, and with a
         norm, returns norm(residual) (the rms_norm_res_in arithmetic). y is left reduced in place as well.
@@ -795,6 +797,27 @@ class TPBackendP2P(TPBackendNative):
         if norm is not None:
             assert out_dtype == torch.half, "fused norm output must be fp16"
             out = torch.empty_like(y, dtype = torch.half)
+        if layer_graph is not None:
+            ext.pg_all_reduce_p2p_fused_layer(
+                self.ptr_g,
+                self.dev_g,
+                self.arena_list,
+                self.ranks_devices,
+                self.rank,
+                y,
+                residual,
+                norm.weight if norm is not None else None,
+                out,
+                norm.rms_norm_eps if norm is not None else 0.0,
+                norm.constant_bias if norm is not None else 0.0,
+                norm.constant_scale if norm is not None else 1.0,
+                1 if norm is not None else 0,
+                self.slot_size,
+                _p2p_fp32,
+                self.abort_flag,
+                layer_graph
+            )
+            return out
         ext.pg_all_reduce_p2p_fused(
             self.ptr_g,
             self.dev_g,
@@ -827,7 +850,7 @@ class TPBackendP2P(TPBackendNative):
 
     def close(self):
         if _p2p_trace and self.device >= 0:
-            print(f" -- TP: device {self.device}: {self.n_p2p} P2P reduces ({self.n_fused} fused with the residual epilogue), {self.n_fallback} CPU-assisted reduces", flush = True)
+            print(f" -- TP: device {self.device}: {self.n_p2p} P2P reduces ({self.n_fused} fused with the residual epilogue), {self.n_fallback} CPU-assisted reduces, {getattr(self, 'n_layer_graph', 0)} layer-graph replays", flush = True)
         if self.use_p2p or self.peer_arenas or self.arena:
             # Unmap peers everywhere before anyone frees an exported arena
             for peer, ptr in self.peer_arenas.items():

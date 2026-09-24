@@ -165,6 +165,7 @@ py::class_<BC_GatedDeltaNetSplit, std::shared_ptr<BC_GatedDeltaNetSplit>>(m, "BC
     py::arg("o_xh")
 )
 .def("run_bszN", &BC_GatedDeltaNetSplit::run_bszN)
+.def("run_bszN_layer", &BC_GatedDeltaNetSplit::run_bszN_layer)
 .def("set_qkvz_bundle", &BC_GatedDeltaNetSplit::set_qkvz_bundle,
     py::arg("ptrs_trellis"),
     py::arg("ptrs_suh"),

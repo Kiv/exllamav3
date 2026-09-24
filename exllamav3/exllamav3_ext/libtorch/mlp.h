@@ -106,6 +106,10 @@ struct BC_GatedMLP
         const at::Tensor& x,
         at::Tensor& d
     );
+
+    // Layer-graph protocol (Graph::layer_mode)
+    std::vector<PPTR> args_bszN(const at::Tensor& x, at::Tensor& d);
+    void run_bszN_layer(const at::Tensor& x, at::Tensor& d, std::shared_ptr<Graph> lg);
 };
 
 
@@ -171,4 +175,9 @@ struct BC_MLP
         const at::Tensor& x,
         at::Tensor& d
     );
+
+    // Layer-graph protocol (Graph::layer_mode): patched-param list for a replay, and the entry that
+    // warms, records into or appends to a graph owned by the caller
+    std::vector<PPTR> args_bsz1(const at::Tensor& x, at::Tensor& d);
+    void run_bsz1_layer(const at::Tensor& x, at::Tensor& d, std::shared_ptr<Graph> lg);
 };

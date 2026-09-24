@@ -3,6 +3,7 @@
 #include <ATen/Tensor.h>
 #include <vector>
 #include <cstdint>
+#include <memory>
 
 // Direct GPU-to-GPU (P2P) all-reduce for the native tensor-parallel backend.
 //
@@ -85,4 +86,25 @@ void pg_all_reduce_p2p_fused
     size_t slot_size,
     bool fp32_wire,
     at::Tensor& abort_flag
+);
+
+void pg_all_reduce_p2p_fused_layer
+(
+    uintptr_t ctx,
+    uintptr_t ctx_dev,
+    std::vector<uintptr_t> arenas,
+    std::vector<int> devices,
+    int this_rank,
+    at::Tensor& tensor,
+    at::Tensor& residual,
+    c10::optional<at::Tensor> weight,
+    c10::optional<at::Tensor> out,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    int mode,
+    size_t slot_size,
+    bool fp32_wire,
+    at::Tensor& abort_flag,
+    std::shared_ptr<class Graph> graph
 );

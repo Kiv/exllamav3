@@ -1,4 +1,5 @@
 #pragma once
+#include <memory>
 
 #include <ATen/Tensor.h>
 
@@ -76,4 +77,15 @@ void rms_norm_gr
     float constant_scale,
     bool span_heads,
     Graph* graph
+);
+
+void rms_norm_layer
+(
+    at::Tensor x,
+    c10::optional<at::Tensor> w,
+    at::Tensor y,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    std::shared_ptr<class Graph> graph
 );

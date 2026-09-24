@@ -280,7 +280,11 @@ class MLP(Module):
             x.dtype == torch.float16 and x.is_contiguous()
         ):
             d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
-            self.bc.run_bsz1(x, d)
+            lg = params.get("layer_graph")
+            if lg is not None:
+                self.bc.run_bsz1_layer(x, d, lg)
+            else:
+                self.bc.run_bsz1(x, d)
             if self.tp_reduce:
                 self.tp_collect(params["backend"], d, final = True)
             return to2(d, out_dtype, self.out_dtype)
@@ -741,7 +745,11 @@ class GatedMLP(Module):
                 if self.bc is not None and bsz * q_len <= MAX_BSZN:
                     d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
                     xv = x.view(1, bsz * q_len, dim)     # local view: x itself feeds every slice
-                    self.bc.run_bszN(xv, d.view(xv.shape))
+                    lg = params.get("layer_graph")
+                    if lg is not None:
+                        self.bc.run_bszN_layer(xv, d.view(xv.shape), lg)
+                    else:
+                        self.bc.run_bszN(xv, d.view(xv.shape))
 
                 elif self.multi_gu[s] is None or bsz * q_len > 32:
                     g = self.gates[s].forward(x, params)

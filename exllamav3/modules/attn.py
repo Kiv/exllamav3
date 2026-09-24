@@ -954,7 +954,8 @@ class Attention(Module):
             return None
         return bca.step(
             x, cache_seqlens, block_table, position, positions, position_ids, inv_freq,
-            causal = params.get("causal", True), host_seqlens = host_seqlens
+            causal = params.get("causal", True), host_seqlens = host_seqlens,
+            layer_graph = params.get("layer_graph")
         )
 
 

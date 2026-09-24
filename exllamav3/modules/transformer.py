@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing_extensions import override
 import torch
+from ..ext import exllamav3_ext as ext
 from ..util.tensor import to2
 from ..model.config import Config
 from . import Module, RMSNorm, LayerNorm, Attention, GatedDeltaNet, GatedMLP, MLP, BlockSparseMLP, Linear
@@ -72,6 +73,8 @@ class TransformerBlock(Module):
         self.register_submodule(self.mlp_post_norm)
 
         self.num_slices = mlp.num_slices if mlp else 1
+        self.layer_graphs = {}
+        self.layer_graph_calls = {}
 
 
     @override
@@ -111,6 +114,8 @@ class TransformerBlock(Module):
 
     def unload(self):
         super().unload()
+        self.layer_graphs = {}
+        self.layer_graph_calls = {}
         self.layer_scalar_t = None
         self.attn_resid_scalar = None
         self.mlp_resid_scalar = None
@@ -133,6 +138,45 @@ class TransformerBlock(Module):
             (self.mlp_resid_scalar.numel() if self.mlp_resid_scalar is not None else 0)
         )
 
+    # Layer graph: under the p2p tensor-parallel backend, a decode step of this block (input norm, attention
+    # block, fused reduce + residual + MLP norm, MLP block, fused reduce + residual) is captured as one CUDA
+    # graph per (bsz, q_len, cache, history, causal) and replayed with the per-step pointers patched. The
+    # sublayers' own per-block graphs are bypassed: each C++ workload is run through its *_layer entry, which
+    # warms eagerly on the first call, records into the block's graph on the second and thereafter only
+    # appends its patched params (Graph::layer_mode). The first call counts graph-aware stages; a shape whose
+    # walk touches anything else (a python attention path, a non-fusable reduce, ...) is never graphed
+    LAYER_GRAPH_STAGES = 5
+
+    def _layer_graph(self, x: torch.Tensor, params: dict, export_state: bool):
+        backend = params.get("backend")
+        if backend is None or not getattr(backend, "use_p2p", False) or not getattr(backend, "layer_graphs_ok", False):
+            return None, None
+        if export_state or params.get("prefill") or params.get("tp_warmup"):
+            return None, None
+        if self.attn is None or self.mlp is None or self.attn_norm is None or self.mlp_norm is None:
+            return None, None
+        if self.attn_hc or self.mlp_hc or self.attn_post_norm or self.mlp_post_norm:
+            return None, None
+        if self.attn_resid_scalar is not None or self.mlp_resid_scalar is not None:
+            return None, None
+        bsz, q_len = x.shape[0], x.shape[1]
+        if bsz * q_len > 16:
+            return None, None
+        # params["cache"] is the cache object in a single-process model and its id (an int) in a TP worker,
+        # where params arrive unpickled per pass; both hash stably by value
+        cache = params.get("cache")
+        cache_key = cache if isinstance(cache, int) else id(cache)
+        key = (bsz, q_len, cache_key, params.get("layer_instance", 0),
+               bool(params.get("recurrent_history", False)), bool(params.get("causal", True)))
+        lg = self.layer_graphs.get(key)
+        if lg is None:
+            lg = self.layer_graphs[key] = ext.Graph()
+            self.layer_graph_calls[key] = 0
+        if lg.layer_mode < 0:
+            return None, None
+        return lg, key
+
+
     @override
     def forward(
         self,
@@ -143,6 +187,41 @@ class TransformerBlock(Module):
 
         export_state = params.get("export_state_layers")
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
+
+        lg, key = self._layer_graph(x, params, export_state)
+        if lg is None:
+            return self._forward_inner(x, params, out_dtype, export_state)
+
+        calls = self.layer_graph_calls[key]
+        if calls == 1:
+            lg.capture_begin()
+        lg.stage_hits = 0
+        params["layer_graph"] = lg
+        try:
+            out = self._forward_inner(x, params, out_dtype, export_state)
+        finally:
+            params.pop("layer_graph", None)
+        if calls == 0:
+            if lg.stage_hits != self.LAYER_GRAPH_STAGES:
+                lg.layer_mode = -1
+        elif calls == 1:
+            lg.capture_end()
+            lg.launch_pending()   # capture only recorded the work; run it
+        else:
+            lg.launch_pending()
+            backend = params["backend"]
+            backend.n_layer_graph = getattr(backend, "n_layer_graph", 0) + 1
+        self.layer_graph_calls[key] = calls + 1
+        return out
+
+
+    def _forward_inner(
+        self,
+        x: torch.Tensor,
+        params: dict,
+        out_dtype: torch.dtype | None,
+        export_state: bool,
+    ) -> torch.Tensor:
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
         y_fused = None  # MLP input already produced by a reduce fused with the residual add + norm
@@ -196,9 +275,9 @@ class TransformerBlock(Module):
                 if pending is not None:
                     norm = self.mlp_norm if (self.mlp is not None and not self.mlp_hc) else None
                     if norm is not None and backend.can_fuse_collect(y, x, norm):
-                        y_fused = backend.all_reduce_fused(y, x, norm, out_dtype = torch.half)
+                        y_fused = backend.all_reduce_fused(y, x, norm, out_dtype = torch.half, layer_graph = params.get("layer_graph"))
                     elif backend.can_fuse_collect(y, x):
-                        backend.all_reduce_fused(y, x)
+                        backend.all_reduce_fused(y, x, layer_graph = params.get("layer_graph"))
                         y = None  # residual add done
                     else:
                         backend.all_reduce(y, pending[1])
@@ -243,7 +322,7 @@ class TransformerBlock(Module):
                 y, pending = collect_pending(y)
                 if pending is not None:
                     if backend.can_fuse_collect(y, x):
-                        backend.all_reduce_fused(y, x)
+                        backend.all_reduce_fused(y, x, layer_graph = params.get("layer_graph"))
                         y = None  # residual add done
                     else:
                         backend.all_reduce(y, pending[1])

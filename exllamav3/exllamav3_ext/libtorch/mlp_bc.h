@@ -37,7 +37,8 @@ py::class_<BC_GatedMLP, std::shared_ptr<BC_GatedMLP>>(m, "BC_GatedMLP").def
     py::arg("down"),
     py::arg("act_limit")
 )
-.def("run_bszN", &BC_GatedMLP::run_bszN);
+.def("run_bszN", &BC_GatedMLP::run_bszN)
+.def("run_bszN_layer", &BC_GatedMLP::run_bszN_layer);
 
 py::class_<BC_MLP, std::shared_ptr<BC_MLP>>(m, "BC_MLP").def
 (
@@ -68,4 +69,5 @@ py::class_<BC_MLP, std::shared_ptr<BC_MLP>>(m, "BC_MLP").def
     py::arg("hidden_size"),
     py::arg("out_size")
 )
-.def("run_bsz1", &BC_MLP::run_bsz1);
+.def("run_bsz1", &BC_MLP::run_bsz1)
+.def("run_bsz1_layer", &BC_MLP::run_bsz1_layer);
