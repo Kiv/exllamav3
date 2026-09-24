@@ -5,6 +5,8 @@
 #include "../util.h"
 #include "../util.cuh"
 
+static_assert(sizeof(PGContext) <= 128 * 1024, "PGContext must fit the G region (GLOBALS_SIZE)");
+
 void pg_init_context(uintptr_t ctx)
 {
     PGContext* ctx_ptr = (PGContext*) ctx;
@@ -30,6 +32,10 @@ void pg_init_context(uintptr_t ctx)
             ctx_ptr->cpusum_stage_recv_mb[(i * CPUREDUCE_MB_BLOCKS + j) * REDUCE_STAGE_STRIDE] = 0;
         }
     }
+
+    for (int r = 0; r < P2P_ROUNDS; ++r)
+        for (int i = 0; i < MAX_DEVICES; ++i)
+            ctx_ptr->p2p_flags[r][i] = 0;
 
     ctx_ptr->reduce_jobs_head = 0;
     ctx_ptr->reduce_jobs_tail = 0;

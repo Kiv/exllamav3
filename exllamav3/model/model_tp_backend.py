@@ -19,6 +19,10 @@ from ..util import log_tp
 GLOBALS_SIZE = 128*1024
 SHBUF_SIZE = 16 * 1024 ** 2
 _nccl_fp32 = os.environ.get("EXL3_TP_NCCL_FP32", "0") != "0"
+_no_p2p = os.environ.get("EXL3_TP_NO_P2P", "0") != "0"
+_p2p_trace = os.environ.get("EXL3_TP_P2P_TRACE", "0") != "0"
+_p2p_fp32 = os.environ.get("EXL3_TP_P2P_FP32", "0") != "0"
+P2P_SETUP_TIMEOUT_MS = 60000
 # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
 SHBUF_SIZE_R = 17 * 8 * 256 * 1024
 SHBUF_SIZE_S = 16 * 1024
@@ -558,3 +562,217 @@ class TPBackendNative:
             ext.end_cpu_reduce_jobs(
                 self.ptr_g,
             )
+
+
+class TPBackendP2P(TPBackendNative):
+
+    def __init__(
+        self,
+        device: int,
+        active_devices: list[int],
+        output_device: int,
+        init_method: str,
+        master: bool,
+        uuid: str,
+        shbuf_size: int = SHBUF_SIZE,
+        cpu: bool = False,
+        slot_size: int = 64 * 1024 ** 2,
+    ):
+        """
+        Native backend with the all-reduce done directly between GPUs.
+
+        Everything the native backend does stays as it is (shared-memory regions, CPU helper process, broadcast,
+        gather, barrier). Only all_reduce() changes: each CUDA rank allocates a landing arena in its own device
+        memory and exports it to the other ranks over CUDA IPC; a reduce is then one kernel per rank that pushes
+        its payload into the peers' arenas and sums what the peers pushed here (see all_reduce_p2p.cuh). The
+        wire formats and rounding are the CPU helper's (fp16 wire for fp16, bf16 wire for bf16 and fp32 payloads,
+        fp32 accumulate, one rounding), so two-rank results are bit-identical to the native backend's.
+        EXL3_TP_P2P_FP32=1 reduces fp32 payloads over an exact fp32 wire instead.
+
+        Setup is a handshake through the G region: every rank publishes its IPC handle and a verdict for each of
+        three stages (arena exported, peers mapped, probe reduce correct). Any rank failing any stage, or
+        EXL3_TP_NO_P2P=1, makes every rank fall back to the CPU-assisted reduce, so the ranks always agree on
+        the path. Payloads larger than one landing slot also take the CPU-assisted path, which stays live for
+        that reason.
+        """
+        super().__init__(device, active_devices, output_device, init_method, master, uuid, shbuf_size, cpu)
+        self.use_p2p = False
+        self.slot_size = slot_size
+        self.arena = 0
+        self.peer_arenas = {}
+        self.n_p2p = 0
+        self.n_fallback = 0
+        self.output_device = output_device
+        if self.cpu or self.device < 0:
+            # The helper process keeps running the CPU reduce loop regardless of the verdict: with P2P active it
+            # only ever sees the end-of-pass marker, and it stays available for oversize payloads
+            return
+        self.rank = active_devices.index(device)
+        self.ranks_devices = list(active_devices)
+        self.p2p_reason = None
+        self._p2p_setup()
+        if self.use_p2p:
+            print(f" -- TP: direct P2P all-reduce active on device {device}")
+        else:
+            print(f" -- TP: P2P all-reduce unavailable on device {device} ({self.p2p_reason}), using CPU-assisted reduce")
+
+
+    def _p2p_verdict(self, stage: int, ok: bool) -> bool:
+        """
+        Publish this rank's verdict for a setup stage and wait for every CUDA rank's. Non-master ranks wait for the
+        master's verdict first, so nothing is published before the master has initialized the shared context.
+        """
+        if not self.master:
+            v = ext.pg_p2p_flag_wait(self.ptr_g, stage, [self.output_device], P2P_SETUP_TIMEOUT_MS)
+            if not v[0]:
+                self.p2p_reason = f"stage {stage}: timeout waiting for master"
+                return False
+        ext.pg_p2p_flag_set(self.ptr_g, stage, self.device, 1 if ok else 2)
+        values = ext.pg_p2p_flag_wait(self.ptr_g, stage, self.active_devices, P2P_SETUP_TIMEOUT_MS)
+        if any(v == 0 for v in values):
+            self.p2p_reason = f"stage {stage}: timeout waiting for ranks"
+            return False
+        if any(v != 1 for v in values):
+            if ok:
+                bad = [d for d, v in zip(self.active_devices, values) if v != 1]
+                self.p2p_reason = f"stage {stage}: failed on device(s) {bad}"
+            return False
+        return True
+
+
+    def _p2p_setup(self):
+        ok = True
+        if len(self.active_devices) < 2:
+            ok = False
+            self.p2p_reason = "single rank"
+        elif _no_p2p:
+            ok = False
+            self.p2p_reason = "EXL3_TP_NO_P2P set"
+        else:
+            for peer in self.active_devices:
+                if peer != self.device and not ext.pg_p2p_can_access(self.device, peer):
+                    ok = False
+                    self.p2p_reason = f"no peer access {self.device} -> {peer}"
+                    break
+        if ok:
+            try:
+                size = ext.pg_p2p_arena_size(len(self.active_devices), self.slot_size)
+                self.arena = ext.pg_p2p_arena_create(self.device, size)
+                ext.pg_p2p_publish(self.ptr_g, self.device, self.arena)
+                log_tp(self.device, f"P2P arena created, {size} bytes")
+            except RuntimeError as e:
+                ok = False
+                self.p2p_reason = f"arena export failed: {e}"
+        if not self._p2p_verdict(0, ok):
+            self._p2p_teardown()
+            return
+
+        # Map every peer's arena
+        try:
+            for peer in self.active_devices:
+                if peer == self.device:
+                    continue
+                self.peer_arenas[peer] = ext.pg_p2p_open(self.ptr_g, self.device, peer)
+                log_tp(self.device, f"P2P arena of device {peer} mapped")
+        except RuntimeError as e:
+            ok = False
+            self.p2p_reason = f"peer mapping failed: {e}"
+        if not self._p2p_verdict(1, ok):
+            self._p2p_teardown()
+            return
+
+        # Probe: a reduce of a deterministic pattern, checked against the host. Every rank reaches this point
+        # or none does, so the kernels' cross-rank waits are matched
+        self.arena_list = [self.arena if d == self.device else self.peer_arenas[d] for d in self.active_devices]
+        try:
+            ok = self._p2p_probe()
+        except RuntimeError as e:
+            ok = False
+            self.p2p_reason = f"probe failed: {e}"
+        if not self._p2p_verdict(2, ok):
+            self._p2p_teardown()
+            return
+        self.use_p2p = True
+
+
+    def _p2p_probe(self) -> bool:
+        n = 4096
+        idx = torch.arange(n, dtype = torch.float32)
+        def pattern(r):
+            return ((idx * (r + 1) + r * 7) % 251) * 0.5 - 30.0
+        expected = torch.zeros(n, dtype = torch.float32)
+        for d in sorted(self.active_devices):
+            expected += pattern(self.active_devices.index(d))
+        expected = expected.half()
+        mine = pattern(self.rank).half()
+        x = torch.empty(n, dtype = torch.half, device = self.device)
+        # Three passes so the landing-slot ring wraps at least once; the reduce is in place, so refill each time
+        for _ in range(3):
+            x.copy_(mine)
+            self._p2p_all_reduce(x)
+            torch.cuda.synchronize(self.device)
+            if self.abort_flag.item():
+                self.p2p_reason = "probe timed out"
+                return False
+            if not torch.equal(x.cpu(), expected):
+                bad = (x.cpu() != expected).sum().item()
+                self.p2p_reason = f"probe mismatch ({bad}/{n} elements)"
+                return False
+        return True
+
+
+    def _p2p_teardown(self):
+        if self.peer_arenas:
+            for peer, ptr in self.peer_arenas.items():
+                ext.pg_p2p_close(self.device, ptr)
+            self.peer_arenas = {}
+        if self.arena:
+            ext.pg_p2p_arena_free(self.device, self.arena)
+            self.arena = 0
+
+
+    def _p2p_all_reduce(self, tensor: torch.Tensor):
+        ext.pg_all_reduce_p2p(
+            self.ptr_g,
+            self.dev_g,
+            self.arena_list,
+            self.ranks_devices,
+            self.rank,
+            tensor,
+            self.slot_size,
+            _p2p_fp32,
+            self.abort_flag
+        )
+
+
+    def _p2p_fits(self, tensor: torch.Tensor) -> bool:
+        if not tensor.is_contiguous() or tensor.numel() % 8:
+            return False
+        wire = 4 if (tensor.dtype == torch.float32 and _p2p_fp32) else 2
+        return tensor.numel() * wire <= self.slot_size
+
+
+    def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        if self.use_p2p and self._p2p_fits(tensor):
+            self.n_p2p += 1
+            self._p2p_all_reduce(tensor)
+        else:
+            self.n_fallback += 1
+            super().all_reduce(tensor, contribution)
+
+
+    def close(self):
+        if _p2p_trace and self.device >= 0:
+            print(f" -- TP: device {self.device}: {self.n_p2p} P2P reduces, {self.n_fallback} CPU-assisted reduces", flush = True)
+        if self.use_p2p or self.peer_arenas or self.arena:
+            # Unmap peers everywhere before anyone frees an exported arena
+            for peer, ptr in self.peer_arenas.items():
+                ext.pg_p2p_close(self.device, ptr)
+            self.peer_arenas = {}
+            ext.pg_p2p_flag_set(self.ptr_g, 3, self.device, 1)
+            ext.pg_p2p_flag_wait(self.ptr_g, 3, self.active_devices, 5000)
+            if self.arena:
+                ext.pg_p2p_arena_free(self.device, self.arena)
+                self.arena = 0
+            self.use_p2p = False
+        super().close()

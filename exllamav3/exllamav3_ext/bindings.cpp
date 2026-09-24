@@ -53,6 +53,7 @@
 #include "parallel/barrier.cuh"
 #include "parallel/gather.cuh"
 #include "parallel/all_reduce.cuh"
+#include "parallel/all_reduce_p2p.cuh"
 
 #include "libtorch/gated_delta_net.h"
 #include "libtorch/attention.h"
@@ -139,6 +140,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_gather_small", &pg_gather_small, "pg_gather_small");
     m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
+    m.def("pg_all_reduce_p2p", &pg_all_reduce_p2p, "pg_all_reduce_p2p");
+    m.def("pg_p2p_arena_size", &pg_p2p_arena_size, "pg_p2p_arena_size");
+    m.def("pg_p2p_arena_create", &pg_p2p_arena_create, "pg_p2p_arena_create");
+    m.def("pg_p2p_arena_free", &pg_p2p_arena_free, "pg_p2p_arena_free");
+    m.def("pg_p2p_can_access", &pg_p2p_can_access, "pg_p2p_can_access");
+    m.def("pg_p2p_publish", &pg_p2p_publish, "pg_p2p_publish");
+    m.def("pg_p2p_open", &pg_p2p_open, "pg_p2p_open");
+    m.def("pg_p2p_close", &pg_p2p_close, "pg_p2p_close");
+    m.def("pg_p2p_flag_set", &pg_p2p_flag_set, "pg_p2p_flag_set");
+    m.def("pg_p2p_flag_wait", &pg_p2p_flag_wait, "pg_p2p_flag_wait");
     m.def("run_cpu_reduce_jobs", &run_cpu_reduce_jobs, "run_cpu_reduce_jobs");
     m.def("end_cpu_reduce_jobs", &end_cpu_reduce_jobs, "end_cpu_reduce_jobs");
 
