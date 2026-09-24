@@ -666,7 +666,7 @@ class SlidingAttention(Module):
         if self.num_kv_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                self.tp_collect(params["backend"], x, False)
+                self.tp_collect(params["backend"], x, False, final = True)
         else:
             bsz, seqlen, _ = x.shape
             attn_mode = params.get("attn_mode", "flash_attn_nc")
@@ -678,7 +678,7 @@ class SlidingAttention(Module):
                 case _:
                     raise ValueError(f"Unknown attn_mode: {attn_mode}")
             if self.tp_reduce:
-                self.tp_collect(params["backend"], x)
+                self.tp_collect(params["backend"], x, final = True)
 
         return to2(x, out_dtype, self.out_dtype)
 

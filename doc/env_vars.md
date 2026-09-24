@@ -716,6 +716,14 @@ platform where peer access is reported but broken). Contributions cross the bus 
 formats with its rounding (fp16 wire for fp16; bf16 wire for bf16 and fp32 payloads), summed in fp32 and rounded
 once, so two-rank outputs are bit-identical to the native backend's.
 
+### `EXL3_TP_P2P_NO_FUSE` (default: `0`)
+
+`p2p` backend only. With the direct all-reduce active, a transformer block fuses each sublayer's reduce
+with its residual epilogue in one kernel: the attention reduce with `x += y` and the MLP input norm, the
+MLP reduce with `x += y` (decode-sized rows only). The fused kernel runs the same reduce and the same
+`rms_norm_res_in` arithmetic, so outputs are unchanged. Set to `1` to run the reduce and the epilogue
+as separate kernels, for A/B comparison.
+
 ### `EXL3_TP_P2P_FP32` (default: `0`)
 
 `p2p` backend only: reduce fp32 payloads over an exact fp32 wire instead of the bf16 wire the native backend

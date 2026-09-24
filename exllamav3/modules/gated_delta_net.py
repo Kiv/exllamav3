@@ -995,7 +995,7 @@ class GatedDeltaNet(Module):
         if self.num_k_heads == 0:
             x = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                self.tp_collect(params["backend"], x, False)
+                self.tp_collect(params["backend"], x, False, final = True)
             return to2(x, out_dtype, self.out_dtype)
 
         bsz, seqlen, _ = x.shape
@@ -1073,7 +1073,7 @@ class GatedDeltaNet(Module):
             y = torch.empty_like(x, dtype = self.out_dtype or torch.half)
             self.bc.run_bszN(x, y, conv_state, recurrent_state, recurrent_slots, save_history)
             if self.tp_reduce:
-                self.tp_collect(params["backend"], y)
+                self.tp_collect(params["backend"], y, final = True)
             return to2(y, out_dtype, self.out_dtype)
 
         # Torch path
@@ -1203,7 +1203,7 @@ class GatedDeltaNet(Module):
 
         # TP reduction
         if self.tp_reduce:
-            self.tp_collect(params["backend"], x)
+            self.tp_collect(params["backend"], x, final = True)
 
         return to2(x, out_dtype, self.out_dtype)
 

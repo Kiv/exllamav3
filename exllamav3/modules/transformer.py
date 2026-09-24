@@ -145,6 +145,37 @@ class TransformerBlock(Module):
         export_state = export_state and self.layer_idx in export_state and params.get("layer_instance", 0) == 0
 
         y_resid = None  # pending attn output whose residual add is folded into the MLP input norm
+        y_fused = None  # MLP input already produced by a reduce fused with the residual add + norm
+
+        # Tensor-parallel backends that can fuse a sublayer's all-reduce with the residual epilogue
+        # (TPBackendP2P.all_reduce_fused): the sublayer parks its partial sums instead of reducing, and
+        # the block reduces them together with x += y and, for attention, the MLP input norm
+        backend = params.get("backend")
+        fuse = (
+            backend is not None and getattr(backend, "use_p2p", False) and not export_state and
+            not params.get("prefill")
+        )
+        fuse_attn = (
+            fuse and self.attn is not None and not self.attn_hc and self.attn_post_norm is None and
+            self.attn_resid_scalar is None
+        )
+        fuse_mlp = (
+            fuse and self.mlp is not None and not self.mlp_hc and self.mlp_post_norm is None and
+            self.mlp_resid_scalar is None
+        )
+
+        def collect_pending(y):
+            # Resolve a deferred collect that could not be fused: reduce the partial sums the way
+            # the sublayer would have, then redo any dtype conversion it applied afterwards
+            pending = backend.pending_collect
+            backend.pending_collect = None
+            if pending is None:
+                return y, None
+            py, contribution = pending
+            if py is not y:
+                backend.all_reduce(py, contribution)
+                return py.to(y.dtype), None
+            return y, pending
 
         if self.attn:
             if self.attn_hc:
@@ -156,12 +187,30 @@ class TransformerBlock(Module):
                 y = self.attn_norm.forward(x, params, out_dtype = torch.half)
             else:
                 y = x.half()
+            if fuse_attn:
+                backend.defer_collect = True
             y = self.attn.forward(y, params)
+            if fuse_attn:
+                backend.defer_collect = False
+                y, pending = collect_pending(y)
+                if pending is not None:
+                    norm = self.mlp_norm if (self.mlp is not None and not self.mlp_hc) else None
+                    if norm is not None and backend.can_fuse_collect(y, x, norm):
+                        y_fused = backend.all_reduce_fused(y, x, norm, out_dtype = torch.half)
+                    elif backend.can_fuse_collect(y, x):
+                        backend.all_reduce_fused(y, x)
+                        y = None  # residual add done
+                    else:
+                        backend.all_reduce(y, pending[1])
             if params.get("prefill") and not export_state:
                 return x
-            if self.attn_resid_scalar is not None:
+            if y_fused is not None or y is None:
+                pass  # residual add already applied by the fused reduce
+            elif self.attn_resid_scalar is not None:
                 y *= self.attn_resid_scalar
-            if self.attn_hc:
+            if y_fused is not None or y is None:
+                pass
+            elif self.attn_hc:
                 x = self.attn_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.attn_post_norm:
                 self.attn_post_norm.forward(y, params, residual = x)
@@ -178,16 +227,33 @@ class TransformerBlock(Module):
                     y = self.mlp_norm.forward(y, params, out_dtype = torch.half)
             else:
                 params["residual"] = x
-                if y_resid is not None:
+                if y_fused is not None:
+                    y = y_fused
+                elif y_resid is not None:
                     y = self.mlp_norm.forward(y_resid, params, out_dtype = torch.half, residual_in = x)
                 elif self.mlp_norm:
                     y = self.mlp_norm.forward(x, params, out_dtype = torch.half)
                 else:
                     y = x.half()
+            if fuse_mlp:
+                backend.defer_collect = True
             y = self.mlp.forward(y, params)
-            if self.mlp_resid_scalar is not None:
+            if fuse_mlp:
+                backend.defer_collect = False
+                y, pending = collect_pending(y)
+                if pending is not None:
+                    if backend.can_fuse_collect(y, x):
+                        backend.all_reduce_fused(y, x)
+                        y = None  # residual add done
+                    else:
+                        backend.all_reduce(y, pending[1])
+            if y is None:
+                pass
+            elif self.mlp_resid_scalar is not None:
                 y *= self.mlp_resid_scalar
-            if self.mlp_hc:
+            if y is None:
+                pass
+            elif self.mlp_hc:
                 x = self.mlp_hc.apply_(x, y, hc_post, hc_comb, params)
             elif self.mlp_post_norm:
                 self.mlp_post_norm.forward(y, params, residual = x)

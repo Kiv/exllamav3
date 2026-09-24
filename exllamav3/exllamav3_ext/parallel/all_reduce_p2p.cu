@@ -9,6 +9,7 @@
 #include "context.cuh"
 #include "timeout.cuh"
 #include "all_reduce_cpu_avx2.h"   // atomic_ref
+#include "../norm_row.cuh"
 #include <thread>
 #include <chrono>
 #include <cstring>
@@ -453,5 +454,273 @@ void pg_all_reduce_p2p
     else TORCH_CHECK(false, "pg_all_reduce_p2p: Unknown dtype");
 
     #undef P2P_LAUNCH
+    cuda_check(cudaPeekAtLastError());
+}
+
+
+// Fused reduce + residual epilogue for decode-sized payloads: one block per row (token). The block first
+// reduces its row exactly as pg_all_reduce_p2p_kernel would (same wire, same rounding, result written back
+// into y in place), then applies the epilogue the transformer block would otherwise launch as separate
+// kernels: P2P_FUSE_NORM runs rms_norm_row<RES_IN> (r += y; out = norm(r) * w, the rms_norm_res_in kernel's
+// arithmetic, same block size so the reduction order is identical); P2P_FUSE_ADD does r += y. Rows are
+// limited to P2P_MAX_BLOCKS by the per-block flags
+#define P2P_FUSE_ADD 0
+#define P2P_FUSE_NORM 1
+
+template <int DT, int WIRE, int MODE, typename output_t, typename weight_t, typename residual_t>
+__global__ __launch_bounds__(P2P_NUM_THREADS)
+void pg_all_reduce_p2p_fused_kernel
+(
+    PGContext* __restrict__ ctx,
+    const P2PPeerArenas peers,
+    const int num_ranks,
+    const int this_rank,
+    uint8_t* __restrict__ data,          // y: (rows, dim) payload, reduced in place
+    residual_t* __restrict__ r,          // residual (rows, dim), updated in place
+    const weight_t* __restrict__ w,      // norm weight (dim), NORM mode
+    output_t* __restrict__ out,          // normed output (rows, dim), NORM mode
+    const int dim,
+    const float epsilon,
+    const float constant_bias,
+    const float constant_scale,
+    const size_t slot_size,
+    uint32_t* abort_flag
+)
+{
+    constexpr int WIRE_LINE = (WIRE == P2P_WIRE_FLOAT) ? 2 : 1;
+    using payload_t = typename std::conditional<DT == P2P_DT_HALF, half, float>::type;
+
+    const int t = threadIdx.x;
+    const int row = blockIdx.x;
+    const int nb = gridDim.x;
+    const int lines_per_row = dim / P2P_LINE_ELEMS;
+    const int line0 = row * lines_per_row;
+    uint8_t* local = peers.arena[this_rank];
+    uint32_t* seq_ctr = (uint32_t*) local;
+    uint32_t* done_ctr = (uint32_t*) (local + 64);
+
+    __shared__ uint32_t s_seq;
+    if (t == 0) s_seq = ldg_cv_u32(seq_ctr) + 1;
+    __syncthreads();
+    const uint32_t seq = s_seq;
+    const int slot = (int) (seq % P2P_NUM_SLOTS);
+
+    auto slot_ptr = [&] (uint8_t* arena, int src_rank)
+    {
+        return (uint4*) (arena + P2P_DATA_OFFSET + ((size_t) slot * num_ranks + src_rank) * slot_size);
+    };
+    auto flag_ptr = [&] (uint8_t* arena, int src_rank, int blk)
+    {
+        return (uint32_t*) (arena + P2P_FLAGS_OFFSET) + (src_rank * P2P_NUM_SLOTS + slot) * P2P_MAX_BLOCKS + blk;
+    };
+
+    // 1. Push this row's lines
+    for (int i = t; i < lines_per_row; i += blockDim.x)
+    {
+        int line = line0 + i;
+        float v[P2P_LINE_ELEMS];
+        uint4 wv[WIRE_LINE];
+        p2p_load_payload<DT>(data, line, v);
+        p2p_to_wire<WIRE>(v, wv);
+        for (int rk = 0; rk < num_ranks; ++rk)
+        {
+            if (rk == this_rank) continue;
+            uint4* dst = slot_ptr(peers.arena[rk], this_rank) + (size_t) line * WIRE_LINE;
+            #pragma unroll
+            for (int j = 0; j < WIRE_LINE; ++j) dst[j] = wv[j];
+        }
+    }
+    __syncthreads();
+    if (t == 0)
+    {
+        for (int rk = 0; rk < num_ranks; ++rk)
+        {
+            if (rk == this_rank) continue;
+            stg_release_sys_u32(flag_ptr(peers.arena[rk], this_rank, row), seq);
+        }
+    }
+
+    // 2. Wait for the peers' copies of this row
+    if (t == 0)
+    {
+        uint64_t deadline = sync_deadline();
+        for (int rk = 0; rk < num_ranks; ++rk)
+        {
+            if (rk == this_rank) continue;
+            uint32_t* f = flag_ptr(local, rk, row);
+            uint32_t spins = 0;
+            while ((int32_t) (ldg_acquire_sys_u32(f) - seq) < 0)
+            {
+                __nanosleep(32);
+                if ((++spins & 0x3ff) == 0 && check_timeout(ctx, deadline, "pg_all_reduce_p2p_fused_kernel"))
+                {
+                    *abort_flag = 1;
+                    break;
+                }
+            }
+            if (*((volatile uint32_t*) abort_flag)) break;
+        }
+    }
+    __syncthreads();
+
+    if (!*((volatile uint32_t*) abort_flag))
+    {
+        // 3. Sum into y in place (identical to the plain kernel)
+        for (int i = t; i < lines_per_row; i += blockDim.x)
+        {
+            int line = line0 + i;
+            float mine[P2P_LINE_ELEMS];
+            uint4 wv[WIRE_LINE];
+            p2p_load_payload<DT>(data, line, mine);
+            p2p_to_wire<WIRE>(mine, wv);
+            float acc[P2P_LINE_ELEMS];
+            for (int k = 0; k < num_ranks; ++k)
+            {
+                int rk = peers.sum_order[k];
+                float v[P2P_LINE_ELEMS];
+                if (rk == this_rank)
+                {
+                    #pragma unroll
+                    for (int j = 0; j < P2P_LINE_ELEMS; ++j) v[j] = mine[j];
+                }
+                else
+                {
+                    const uint4* src = slot_ptr(local, rk) + (size_t) line * WIRE_LINE;
+                    uint4 lw[WIRE_LINE];
+                    #pragma unroll
+                    for (int j = 0; j < WIRE_LINE; ++j) lw[j] = __ldcg(src + j);
+                    p2p_from_wire<WIRE>(lw, v);
+                }
+                #pragma unroll
+                for (int j = 0; j < P2P_LINE_ELEMS; ++j) acc[j] = (k == 0) ? v[j] : acc[j] + v[j];
+            }
+            p2p_store_result<DT, WIRE>(data, line, acc);
+        }
+        __syncthreads();
+
+        // 4. Epilogue on the reduced row
+        if constexpr (MODE == P2P_FUSE_NORM)
+        {
+            rms_norm_row<RES_IN, payload_t, output_t, weight_t, residual_t>
+                ((const payload_t*) data, w, out, r, epsilon, row, dim, constant_bias, constant_scale, 1);
+        }
+        else
+        {
+            // r += y, computed in fp32 and rounded to the residual dtype: what torch's in-place add does
+            const payload_t* y = (const payload_t*) data + (size_t) row * dim;
+            residual_t* rr = r + (size_t) row * dim;
+            for (int c = t; c < dim; c += blockDim.x)
+            {
+                float yv, rv;
+                if constexpr (std::is_same_v<payload_t, half>) yv = __half2float(y[c]); else yv = y[c];
+                if constexpr (std::is_same_v<residual_t, half>) rv = __half2float(rr[c]); else rv = rr[c];
+                float sum = rv + yv;
+                if constexpr (std::is_same_v<residual_t, half>) rr[c] = __float2half_rn(sum); else rr[c] = sum;
+            }
+        }
+    }
+
+    // 5. Last block out advances the sequence counter
+    __syncthreads();
+    if (t == 0)
+    {
+        uint32_t prev = atomicInc(done_ctr, (unsigned int) nb - 1);
+        if (prev == (unsigned int) nb - 1)
+        {
+            __threadfence();
+            stg_wt_u32(seq_ctr, seq);
+        }
+    }
+}
+
+
+void pg_all_reduce_p2p_fused
+(
+    uintptr_t ctx,
+    uintptr_t ctx_dev,
+    std::vector<uintptr_t> arenas,
+    std::vector<int> devices,
+    int this_rank,
+    at::Tensor& tensor,
+    at::Tensor& residual,
+    c10::optional<at::Tensor> weight,
+    c10::optional<at::Tensor> out,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    int mode,
+    size_t slot_size,
+    bool fp32_wire,
+    at::Tensor& abort_flag
+)
+{
+    const int num_ranks = (int) devices.size();
+    TORCH_CHECK(num_ranks >= 2 && num_ranks <= P2P_MAX_RANKS, "pg_all_reduce_p2p_fused: bad rank count");
+    TORCH_CHECK(arenas.size() == devices.size(), "pg_all_reduce_p2p_fused: arenas/devices mismatch");
+    const int this_device = devices[this_rank];
+
+    const at::cuda::OptionalCUDAGuard device_guard(this_device);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
+    pg_check_timeout(ctx);
+
+    const int dim = (int) tensor.size(-1);
+    const int64_t numel = tensor.numel();
+    const int rows = (int) (numel / dim);
+    TORCH_CHECK(tensor.is_contiguous() && residual.is_contiguous(), "pg_all_reduce_p2p_fused: tensors must be contiguous");
+    TORCH_CHECK(dim % P2P_LINE_ELEMS == 0, "pg_all_reduce_p2p_fused: dim must be a multiple of 8");
+    TORCH_CHECK(rows >= 1 && rows <= P2P_MAX_BLOCKS, "pg_all_reduce_p2p_fused: too many rows");
+    TORCH_CHECK(residual.numel() == numel, "pg_all_reduce_p2p_fused: residual shape mismatch");
+    const bool wire_f32 = tensor.dtype() == at::kFloat && fp32_wire;
+    const size_t wire_bytes = (size_t) numel * (wire_f32 ? 4 : 2);
+    TORCH_CHECK(wire_bytes <= slot_size, "pg_all_reduce_p2p_fused: payload exceeds landing slot");
+    if (mode == P2P_FUSE_NORM)
+    {
+        TORCH_CHECK(weight.has_value() && out.has_value(), "pg_all_reduce_p2p_fused: norm mode needs weight and out");
+        TORCH_CHECK(weight.value().numel() == dim, "pg_all_reduce_p2p_fused: weight shape mismatch");
+        TORCH_CHECK(out.value().numel() == numel && out.value().is_contiguous(), "pg_all_reduce_p2p_fused: out shape mismatch");
+    }
+
+    P2PPeerArenas peers;
+    for (int r = 0; r < P2P_MAX_RANKS; ++r) { peers.arena[r] = nullptr; peers.sum_order[r] = 0; }
+    for (int r = 0; r < num_ranks; ++r) peers.arena[r] = (uint8_t*) arenas[r];
+    std::vector<int> order(num_ranks);
+    for (int r = 0; r < num_ranks; ++r) order[r] = r;
+    std::sort(order.begin(), order.end(), [&] (int a, int b) { return devices[a] < devices[b]; });
+    for (int r = 0; r < num_ranks; ++r) peers.sum_order[r] = (uint8_t) order[r];
+
+    // Same block size as rms_norm for this row width, so the norm's reduction order matches
+    const int threads = rms_norm_threads(dim);
+    PGContext* ctx_d = (PGContext*) ctx_dev;
+    uint32_t* abort_flag_ptr = (uint32_t*) abort_flag.data_ptr();
+    uint8_t* data_ptr = (uint8_t*) tensor.data_ptr();
+    void* r_ptr = residual.data_ptr();
+    const void* w_ptr = weight.has_value() ? weight.value().data_ptr() : nullptr;
+    void* o_ptr = out.has_value() ? out.value().data_ptr() : nullptr;
+    auto tp = tensor.scalar_type(); auto tr = residual.scalar_type();
+    auto tw = weight.has_value() ? weight.value().scalar_type() : at::kHalf;
+    auto to = out.has_value() ? out.value().scalar_type() : at::kHalf;
+
+    #define P2P_FLAUNCH(DT, WIRE, MODE, OT, WT, RT) \
+        pg_all_reduce_p2p_fused_kernel<DT, WIRE, MODE, OT, WT, RT><<<rows, threads, 0, stream>>> \
+            (ctx_d, peers, num_ranks, this_rank, data_ptr, (RT*) r_ptr, (const WT*) w_ptr, (OT*) o_ptr, \
+             dim, epsilon, constant_bias, constant_scale, slot_size, abort_flag_ptr)
+    #define P2P_FDISPATCH_RT(DT, WIRE, MODE, OT, WT) \
+        if (tr == at::kFloat) P2P_FLAUNCH(DT, WIRE, MODE, OT, WT, float); \
+        else if (tr == at::kHalf) P2P_FLAUNCH(DT, WIRE, MODE, OT, WT, half); \
+        else TORCH_CHECK(false, "pg_all_reduce_p2p_fused: residual dtype")
+    #define P2P_FDISPATCH_MODE(DT, WIRE) \
+        if (mode == P2P_FUSE_ADD) { P2P_FDISPATCH_RT(DT, WIRE, P2P_FUSE_ADD, half, half); } \
+        else if (tw == at::kHalf && to == at::kHalf) { P2P_FDISPATCH_RT(DT, WIRE, P2P_FUSE_NORM, half, half); } \
+        else if (tw == at::kBFloat16 && to == at::kHalf) { P2P_FDISPATCH_RT(DT, WIRE, P2P_FUSE_NORM, half, bfloat16); } \
+        else TORCH_CHECK(false, "pg_all_reduce_p2p_fused: weight/out dtype")
+
+    if (tp == at::kHalf) { P2P_FDISPATCH_MODE(P2P_DT_HALF, P2P_WIRE_HALF); }
+    else if (tp == at::kFloat && wire_f32) { P2P_FDISPATCH_MODE(P2P_DT_FLOAT, P2P_WIRE_FLOAT); }
+    else if (tp == at::kFloat) { P2P_FDISPATCH_MODE(P2P_DT_FLOAT, P2P_WIRE_BF16); }
+    else TORCH_CHECK(false, "pg_all_reduce_p2p_fused: payload dtype");
+
+    #undef P2P_FLAUNCH
+    #undef P2P_FDISPATCH_RT
+    #undef P2P_FDISPATCH_MODE
     cuda_check(cudaPeekAtLastError());
 }
