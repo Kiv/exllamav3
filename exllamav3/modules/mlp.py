@@ -282,7 +282,7 @@ class MLP(Module):
             d = torch.empty_like(x, dtype = out_dtype or self.out_dtype)
             self.bc.run_bsz1(x, d)
             if self.tp_reduce:
-                self.tp_collect(params["backend"], d)
+                self.tp_collect(params["backend"], d, final = True)
             return to2(d, out_dtype, self.out_dtype)
 
         qs = params.get("q_mlp_slice")
@@ -304,7 +304,7 @@ class MLP(Module):
             del d_
 
         if self.tp_reduce:
-            self.tp_collect(params["backend"], d)
+            self.tp_collect(params["backend"], d, final = True)
 
         return to2(d, out_dtype, self.out_dtype)
 
@@ -730,7 +730,7 @@ class GatedMLP(Module):
         if self.num_slices == 0:
             d = torch.zeros_like(x, dtype = self.out_dtype)
             if self.tp_reduce:
-                self.tp_collect(params["backend"], d, False)
+                self.tp_collect(params["backend"], d, False, final = True)
         else:
             qs = params.get("q_mlp_slice")
             r = [qs] if qs is not None else range(0, self.num_slices)
@@ -787,7 +787,7 @@ class GatedMLP(Module):
                     del d_
 
             if self.tp_reduce:
-                self.tp_collect(params["backend"], d)
+                self.tp_collect(params["backend"], d, final = True)
 
         return to2(d, out_dtype, self.out_dtype)
 

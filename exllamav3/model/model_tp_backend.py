@@ -22,6 +22,8 @@ _nccl_fp32 = os.environ.get("EXL3_TP_NCCL_FP32", "0") != "0"
 _no_p2p = os.environ.get("EXL3_TP_NO_P2P", "0") != "0"
 _p2p_trace = os.environ.get("EXL3_TP_P2P_TRACE", "0") != "0"
 _p2p_fp32 = os.environ.get("EXL3_TP_P2P_FP32", "0") != "0"
+_p2p_no_fuse = os.environ.get("EXL3_TP_P2P_NO_FUSE", "0") != "0"
+P2P_MAX_FUSED_ROWS = 16
 P2P_SETUP_TIMEOUT_MS = 60000
 # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
 SHBUF_SIZE_R = 17 * 8 * 256 * 1024
@@ -602,6 +604,12 @@ class TPBackendP2P(TPBackendNative):
         self.peer_arenas = {}
         self.n_p2p = 0
         self.n_fallback = 0
+        self.n_fused = 0
+        # Deferred-collect protocol: a block sets defer_collect before running a sublayer whose reduce it
+        # wants fused with the residual add / next norm; Module.tp_collect then parks the partial sums in
+        # pending_collect instead of reducing (see TransformerBlock.forward)
+        self.defer_collect = False
+        self.pending_collect = None
         self.output_device = output_device
         if self.cpu or self.device < 0:
             # The helper process keeps running the CPU reduce loop regardless of the verdict: with P2P active it
@@ -752,6 +760,62 @@ class TPBackendP2P(TPBackendNative):
         return tensor.numel() * wire <= self.slot_size
 
 
+    def can_fuse_collect(self, y: torch.Tensor, residual: torch.Tensor, norm = None) -> bool:
+        """
+        True if all_reduce_fused() can take this (y, residual[, norm]): the P2P path is active, decode-sized
+        rows (one block per row), fp16/fp32 payload and residual, and for the norm a plain weighted RMSNorm
+        with a half/bf16 weight producing fp16
+        """
+        if not self.use_p2p or _p2p_no_fuse or not self._p2p_fits(y):
+            return False
+        dim = y.shape[-1]
+        if dim % 8 or y.numel() // dim > P2P_MAX_FUSED_ROWS or y.shape != residual.shape:
+            return False
+        if y.dtype not in (torch.float32, torch.float16) or residual.dtype not in (torch.float32, torch.float16):
+            return False
+        if not residual.is_contiguous():
+            return False
+        if norm is not None:
+            if norm.weight is None or norm.span_heads or norm.groups != 1 or norm.unweighted:
+                return False
+            if norm.weight.dtype not in (torch.float16, torch.bfloat16) or norm.weight.numel() != dim:
+                return False
+        return True
+
+
+    def all_reduce_fused(self, y: torch.Tensor, residual: torch.Tensor, norm = None, out_dtype = torch.half):
+        """
+        Reduce y across ranks and apply the residual epilogue in the same kernel: residual += y, and with a
+        norm, returns norm(residual) (the rms_norm_res_in arithmetic). y is left reduced in place as well.
+        Bit-identical to all_reduce() followed by the separate torch add / rms_norm_res_in kernel.
+        """
+        self.n_p2p += 1
+        self.n_fused += 1
+        out = None
+        if norm is not None:
+            assert out_dtype == torch.half, "fused norm output must be fp16"
+            out = torch.empty_like(y, dtype = torch.half)
+        ext.pg_all_reduce_p2p_fused(
+            self.ptr_g,
+            self.dev_g,
+            self.arena_list,
+            self.ranks_devices,
+            self.rank,
+            y,
+            residual,
+            norm.weight if norm is not None else None,
+            out,
+            norm.rms_norm_eps if norm is not None else 0.0,
+            norm.constant_bias if norm is not None else 0.0,
+            norm.constant_scale if norm is not None else 1.0,
+            1 if norm is not None else 0,
+            self.slot_size,
+            _p2p_fp32,
+            self.abort_flag
+        )
+        return out
+
+
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
         if self.use_p2p and self._p2p_fits(tensor):
             self.n_p2p += 1
@@ -763,7 +827,7 @@ class TPBackendP2P(TPBackendNative):
 
     def close(self):
         if _p2p_trace and self.device >= 0:
-            print(f" -- TP: device {self.device}: {self.n_p2p} P2P reduces, {self.n_fallback} CPU-assisted reduces", flush = True)
+            print(f" -- TP: device {self.device}: {self.n_p2p} P2P reduces ({self.n_fused} fused with the residual epilogue), {self.n_fallback} CPU-assisted reduces", flush = True)
         if self.use_p2p or self.peer_arenas or self.arena:
             # Unmap peers everywhere before anyone frees an exported arena
             for peer, ptr in self.peer_arenas.items():

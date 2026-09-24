@@ -90,9 +90,18 @@ class Module(ABC):
     # a sum through the reduce wire (which rounds fp32 outputs to bf16 on the native backend)
     tp_owner: int | None = None
 
-    def tp_collect(self, backend, x: torch.Tensor, contribution: bool = True):
+    def tp_collect(self, backend, x: torch.Tensor, contribution: bool = True, final: bool = False):
+        """
+        Reduce (or broadcast, for single-owner modules) a sublayer output across ranks. final = True marks
+        the module's last collect, whose result is only consumed by the enclosing block: the block may then
+        ask for it to be deferred and fused with the residual epilogue
+        """
         if self.tp_owner is not None:
             backend.broadcast(x, self.tp_owner)
+        elif final and getattr(backend, "defer_collect", False):
+            # The enclosing block asked to fuse this reduce with its residual epilogue: hand the partial
+            # sums back instead of reducing (see TransformerBlock.forward and TPBackendP2P.all_reduce_fused)
+            backend.pending_collect = (x, contribution)
         else:
             backend.all_reduce(x, contribution)
 

@@ -64,3 +64,25 @@ void pg_all_reduce_p2p
     bool fp32_wire,   // fp32 payloads: exact fp32 wire instead of the native backend's bf16 wire
     at::Tensor& abort_flag
 );
+
+// Fused reduce + residual epilogue for decode-sized payloads (rows <= P2P_MAX_BLOCKS). mode 0: residual += y;
+// mode 1: residual += y, out = rmsnorm(residual) * weight (rms_norm_res_in arithmetic). y is reduced in place too.
+void pg_all_reduce_p2p_fused
+(
+    uintptr_t ctx,
+    uintptr_t ctx_dev,
+    std::vector<uintptr_t> arenas,
+    std::vector<int> devices,
+    int this_rank,
+    at::Tensor& tensor,
+    at::Tensor& residual,
+    c10::optional<at::Tensor> weight,
+    c10::optional<at::Tensor> out,
+    float epsilon,
+    float constant_bias,
+    float constant_scale,
+    int mode,
+    size_t slot_size,
+    bool fp32_wire,
+    at::Tensor& abort_flag
+);

@@ -141,6 +141,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("pg_all_reduce", &pg_all_reduce, "pg_all_reduce");
     m.def("pg_all_reduce_cpu", &pg_all_reduce_cpu, "pg_all_reduce_cpu");
     m.def("pg_all_reduce_p2p", &pg_all_reduce_p2p, "pg_all_reduce_p2p");
+    m.def("pg_all_reduce_p2p_fused", &pg_all_reduce_p2p_fused, "pg_all_reduce_p2p_fused");
     m.def("pg_p2p_arena_size", &pg_p2p_arena_size, "pg_p2p_arena_size");
     m.def("pg_p2p_arena_create", &pg_p2p_arena_create, "pg_p2p_arena_create");
     m.def("pg_p2p_arena_free", &pg_p2p_arena_free, "pg_p2p_arena_free");

@@ -69,10 +69,62 @@ def _worker(device, active_devices, output_device, uid, conn):
             if backend.abort_flag.item():
                 failures.append(f"abort flag set at iter {it}")
                 break
+        failures += _fused_checks(backend, device, rank)
         backend.close()
         conn.send(("ok", failures))
     except Exception as e:
         conn.send(("error", repr(e)))
+
+
+def _fused_checks(backend, device, rank):
+    """
+    all_reduce_fused (reduce + residual add [+ RMSNorm] in one kernel) against the separate kernels it
+    replaces: all_reduce, then ext.rms_norm_res_in or torch's in-place add. Bit for bit, every combination
+    the transformer block can hand it
+    """
+    from types import SimpleNamespace
+    from exllamav3.ext import exllamav3_ext as ext
+    failures = []
+    dim = 5120
+    eps = 1e-6
+    for rows in (1, 5, 16):
+        for payload_dt, resid_dt, w_dt in (
+            (torch.float32, torch.float32, torch.float16),
+            (torch.float32, torch.float32, torch.bfloat16),
+            (torch.float32, torch.float16, torch.float16),
+            (torch.float16, torch.float16, torch.float16),
+            (torch.float16, torch.float32, torch.bfloat16),
+        ):
+            g = torch.Generator().manual_seed(rows * 7919 + rank)
+            y = (torch.randn(rows, dim, generator = g) * 8).to(payload_dt).to(device)
+            x = (torch.randn(rows, dim, generator = g) * 4).to(resid_dt).to(device)
+            g2 = torch.Generator().manual_seed(4242)
+            w = (torch.rand(dim, generator = g2) + 0.5).to(w_dt).to(device)
+            norm = SimpleNamespace(weight = w, rms_norm_eps = eps, constant_bias = 0.0, constant_scale = 1.0,
+                                   span_heads = False, groups = 1, unweighted = False)
+            # reference: plain reduce, then the block's separate epilogue kernels
+            y_ref = y.clone(); backend.all_reduce(y_ref)
+            x_ref = x.clone(); out_ref = torch.empty(rows, dim, dtype = torch.half, device = device)
+            ext.rms_norm_res_in(y_ref, w, out_ref, x_ref, eps, 0.0, 1.0)
+            x_add = x.clone(); x_add += y_ref
+            # fused norm
+            if not backend.can_fuse_collect(y, x, norm):
+                failures.append(f"fused norm declined rows={rows} {payload_dt} {resid_dt} {w_dt}")
+                continue
+            y_f = y.clone(); x_f = x.clone()
+            out_f = backend.all_reduce_fused(y_f, x_f, norm, out_dtype = torch.half)
+            torch.cuda.synchronize(device)
+            for name, a, b in (("y", y_f, y_ref), ("residual", x_f, x_ref), ("out", out_f, out_ref)):
+                if not torch.equal(a, b):
+                    failures.append(f"fused norm {name} mismatch rows={rows} {payload_dt} {resid_dt} {w_dt}: {(a != b).sum().item()} elems")
+            # fused add
+            y_a = y.clone(); x_a = x.clone()
+            backend.all_reduce_fused(y_a, x_a)
+            torch.cuda.synchronize(device)
+            for name, a, b in (("y", y_a, y_ref), ("residual", x_a, x_add)):
+                if not torch.equal(a, b):
+                    failures.append(f"fused add {name} mismatch rows={rows} {payload_dt} {resid_dt}: {(a != b).sum().item()} elems")
+    return failures
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason = "needs two GPUs")
