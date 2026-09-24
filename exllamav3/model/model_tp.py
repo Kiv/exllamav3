@@ -36,7 +36,7 @@ class Model_TPMixin:
         self.tp_pending_acks = []
         self.tp_pending_refs = None
 
-    def create_tp_context(self, tp_backend: str):
+    def create_tp_context(self, tp_backend: str, p2p_slot_size: int | None = None):
         """
         Create the tensor-parallel worker context.
 
@@ -75,6 +75,13 @@ class Model_TPMixin:
                     "type": tp_backend,
                     "init_method": f"tcp://{master_addr}:{master_port}",
                     "uuid": uuid.uuid4().hex,
+                }
+            case "p2p":
+                backend_args = {
+                    "type": tp_backend,
+                    "init_method": f"tcp://{master_addr}:{master_port}",
+                    "uuid": uuid.uuid4().hex,
+                    "p2p_slot_size": p2p_slot_size or 64 * 1024 ** 2,
                 }
             case _:
                 raise ValueError(f"Unkwown backend type: {tp_backend}")
@@ -470,7 +477,15 @@ class Model_TPMixin:
 
         # Create TP context
         self.active_devices = active_devices
-        self.create_tp_context(tp_backend)
+        # P2P landing slot: one prefill chunk of the residual stream at 16 bits. Larger payloads (fp32
+        # residual streams, oversized chunks) take the CPU-assisted reduce instead
+        p2p_slot_size = None
+        if tp_backend == "p2p":
+            hidden = getattr(config, "hidden_size", None) or 8192
+            p2p_slot_size = int(os.environ.get("EXL3_TP_P2P_SLOT_MB", "0") or "0") * 1024 ** 2
+            if not p2p_slot_size:
+                p2p_slot_size = max_chunk_size * hidden * 2
+        self.create_tp_context(tp_backend, p2p_slot_size)
 
         # Split model
         num_devices = max(self.active_devices) + 1

@@ -705,6 +705,28 @@ ordered by their own stage counters, so the barrier is not required for correctn
 saves one spin-kernel launch per rank per pass. Set to `0` to restore the barrier (one aligned
 sync point per pass at the cost of a small amount of GPU spin time).
 
+### `EXL3_TP_NO_P2P` (default: `0`)
+
+`p2p` backend only. The `p2p` tensor-parallel backend is the native backend with the all-reduce done directly
+between GPUs: each rank pushes its payload into the other ranks' device memory (mapped over CUDA IPC) and sums
+what the others pushed here, with no host memory or CPU helper on the path. At load, the ranks check peer
+access, map each other's landing arenas and run a probe reduce checked on the host; if any rank fails any
+step, every rank falls back to the CPU-assisted reduce. Set to `1` to force that fallback (A/B testing, or a
+platform where peer access is reported but broken). Contributions cross the bus in the native backend's wire
+formats with its rounding (fp16 wire for fp16; bf16 wire for bf16 and fp32 payloads), summed in fp32 and rounded
+once, so two-rank outputs are bit-identical to the native backend's.
+
+### `EXL3_TP_P2P_FP32` (default: `0`)
+
+`p2p` backend only: reduce fp32 payloads over an exact fp32 wire instead of the bf16 wire the native backend
+uses for fp32 sublayer outputs. Exact, twice the bytes per reduce, and no longer bit-identical to the native
+backend; the counterpart of `EXL3_TP_NCCL_FP32`.
+
+### `EXL3_TP_P2P_SLOT_MB` (default: one prefill chunk of the residual stream at 16 bits)
+
+`p2p` backend only. Size in MB of each landing slot; each rank allocates `2 × ranks` slots. Payloads larger
+than a slot take the CPU-assisted reduce.
+
 ### `EXL3_TP_NO_FP16_WIRE` (default: `0`)
 
 The native backend's CPU-assisted all-reduce moves fp16 payloads over an fp16 wire when the CPU
