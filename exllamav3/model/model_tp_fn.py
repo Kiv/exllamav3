@@ -9,7 +9,7 @@ from collections import deque
 from .model_tp_shared import SMProducer, SMConsumer
 from ..ext import exllamav3_ext as ext
 from functools import lru_cache
-from .model_tp_backend import TPBackendNCCL, TPBackendNative, TPBackendNull
+from .model_tp_backend import TPBackendNCCL, TPBackendNative, TPBackendNull, TPBackendP2P
 from ..tokenizer.mm_embedding import recv_embeddings
 from ..util import log_tp, set_t0
 
@@ -59,6 +59,17 @@ def init_pg(device: int, active_devices: list[int], output_device: int, backend_
                 master = master,
                 uuid = backend_args["uuid"],
                 cpu = device < 0
+            )
+        case "p2p":
+            backend = TPBackendP2P(
+                device = device,
+                active_devices = active_devices,
+                output_device = output_device,
+                init_method = backend_args["init_method"],
+                master = master,
+                uuid = backend_args["uuid"],
+                cpu = device < 0,
+                slot_size = backend_args["p2p_slot_size"],
             )
         case _:
             raise ValueError("Unknown backend type")

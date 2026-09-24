@@ -27,6 +27,11 @@
 #define REDUCE_WIRE_BF16 0
 #define REDUCE_WIRE_FP16 1
 
+// P2P all-reduce setup handshake (see all_reduce_p2p.cuh): one IPC handle per device plus a few rounds of
+// per-device flags that the ranks use to agree on whether the direct path is usable
+#define P2P_IPC_HANDLE_SIZE 64
+#define P2P_ROUNDS 4
+
 struct ReduceJob
 {
     size_t data_size;
@@ -62,6 +67,8 @@ struct alignas(64) PGContext
     alignas(64) uint32_t cpusum_stage_recv_mb[MAX_DEVICES * CPUREDUCE_MB_BLOCKS * REDUCE_STAGE_STRIDE];
     alignas(64) uint32_t cpusum_stage_cpu; char _pad4[64 - sizeof(uint32_t)];
     ReduceJob reduce_jobs[MAX_REDUCE_JOBS];
+    alignas(64) uint8_t p2p_ipc_handle[MAX_DEVICES][P2P_IPC_HANDLE_SIZE];
+    alignas(64) uint32_t p2p_flags[P2P_ROUNDS][MAX_DEVICES];
 };
 
 void pg_init_context(uintptr_t ctx);
