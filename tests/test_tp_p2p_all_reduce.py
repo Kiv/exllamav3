@@ -1,13 +1,12 @@
-import os
 import uuid
 import pytest
 import torch
 import multiprocessing as mp
 
 # Drives TPBackendP2P directly in two spawned worker processes (no model, no CPU helper): random-size reduces
-# across the three payload dtypes, every result compared bit for bit with a host reference that accumulates in
-# fp32 in ascending device order and rounds once, which is the contract the kernel makes with the CPU-assisted
-# reduce. Enough iterations that the landing-slot ring wraps many times, and payloads up to a few MB so the
+# across the three payload dtypes, every result compared bit for bit with a host reference that accumulates the
+# ranks' wire-rounded contributions in fp32 in rank order and rounds once, which is the kernel's contract.
+# Enough iterations that the landing-slot ring wraps many times, and payloads up to a few MB so the
 # multi-block striping and per-block flags are exercised. Skips when there are not two GPUs with peer access.
 
 SIZES = [8, 64, 640, 5120, 5 * 5120, 65536, 262144, 1 << 20]  # elements
@@ -34,9 +33,10 @@ def _worker(device, active_devices, output_device, uid, conn):
             backend.close()
             return
         rank = active_devices.index(device)
-        order = sorted(range(len(active_devices)), key = lambda r: active_devices[r])
         failures = []
         for it in range(ITERS):
+            if len(failures) > 8:
+                break
             for dtype in DTYPES:
                 for n in SIZES:
                     g = torch.Generator().manual_seed(it * 100003 + n)
@@ -50,8 +50,8 @@ def _worker(device, active_devices, output_device, uid, conn):
                         return ((u + 0x8000) & -65536).view(torch.float32)
                     contrib = [bf16_native(p) if dtype == torch.float32 else p.float() for p in parts]
                     ref = torch.zeros(n, dtype = torch.float32)
-                    for r in order:
-                        ref += contrib[r]
+                    for c in contrib:
+                        ref += c
                     if dtype == torch.float32:
                         ref = bf16_native(ref)
                     elif dtype == torch.bfloat16:
@@ -64,8 +64,6 @@ def _worker(device, active_devices, output_device, uid, conn):
                     if not torch.equal(got, ref):
                         bad = (got != ref).sum().item()
                         failures.append(f"iter {it} {dtype} n={n}: {bad} mismatches")
-                        if len(failures) > 8:
-                            break
             if backend.abort_flag.item():
                 failures.append(f"abort flag set at iter {it}")
                 break
@@ -80,8 +78,6 @@ def test_p2p_all_reduce_bit_exact():
     from exllamav3.ext import exllamav3_ext as ext
     if not (ext.pg_p2p_can_access(0, 1) and ext.pg_p2p_can_access(1, 0)):
         pytest.skip("no peer access between GPU 0 and 1")
-    if os.environ.get("EXL3_TP_NO_P2P", "0") != "0":
-        pytest.skip("EXL3_TP_NO_P2P set")
 
     ctx = mp.get_context("spawn")
     active_devices = [0, 1]

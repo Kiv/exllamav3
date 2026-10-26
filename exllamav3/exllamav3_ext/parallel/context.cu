@@ -42,6 +42,15 @@ void pg_init_context(uintptr_t ctx)
     ctx_ptr->cpusum_stage_cpu = 0;
 }
 
+void pg_reset_timeout(uintptr_t ctx)
+{
+    // The sticky timeout flag is shared by the whole process group and is otherwise only cleared at init.
+    // The p2p handshake runs before any forward pass, so a rank that spun out waiting for a peer that gave
+    // up mid-probe must be able to clear it, or every later collective would raise on the fallback path
+    PGContext* ctx_ptr = (PGContext*) ctx;
+    ((volatile uint32_t*) &ctx_ptr->sync_timeout)[0] = 0;
+}
+
 void pg_check_timeout(uintptr_t ctx)
 {
     PGContext* ctx_ptr = (PGContext*) ctx;

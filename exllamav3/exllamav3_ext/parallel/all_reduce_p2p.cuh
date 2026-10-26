@@ -11,7 +11,8 @@
 // writes), release a per-block flag in the peer's arena, spin on the corresponding flags in the LOCAL arena,
 // then sum local + landed in fp32 and round once. No host-side work per call, so the kernel is graph-capturable.
 // Contributions cross the bus in the same wire format and with the same rounding as the CPU-assisted reduce
-// (fp16 wire for fp16, bf16 wire for bf16 and, by default, for fp32), so results are bit-identical to it.
+// (fp16 wire for fp16, bf16 wire for bf16 and, by default, for fp32), so at two ranks results are bit-identical
+// to it. The sum is taken in rank order, identically on every rank.
 //
 // Arena layout (bytes):
 //   [0, 64)                         seq counter: number of reduces completed on this rank (device-side sequence
@@ -34,17 +35,13 @@
 struct P2PPeerArenas
 {
     uint8_t* arena[P2P_MAX_RANKS];   // indexed by rank; this rank's own arena at [this_rank]
-    uint8_t sum_order[P2P_MAX_RANKS];  // ranks in ascending device order, the CPU helper's accumulation order
 };
 
-// Arena lifecycle (each CUDA rank, its own device)
-size_t pg_p2p_arena_size(int num_ranks, size_t slot_size);
-uintptr_t pg_p2p_arena_create(int device, size_t size);
-void pg_p2p_arena_free(int device, uintptr_t arena);
-
-// IPC handle exchange through the shared PGContext (host VA)
+// Arena lifecycle (each CUDA rank, its own device): create allocates, zeroes and publishes the arena's IPC
+// handle in the shared PGContext (host VA); open maps a peer's published arena
 bool pg_p2p_can_access(int device, int peer_device);
-void pg_p2p_publish(uintptr_t ctx, int device, uintptr_t arena);
+uintptr_t pg_p2p_arena_create(uintptr_t ctx, int device, int num_ranks, size_t slot_size);
+void pg_p2p_arena_free(int device, uintptr_t arena);
 uintptr_t pg_p2p_open(uintptr_t ctx, int device, int peer_device);
 void pg_p2p_close(int device, uintptr_t peer_arena);
 

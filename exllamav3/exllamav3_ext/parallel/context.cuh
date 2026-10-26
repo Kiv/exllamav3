@@ -72,4 +72,5 @@ struct alignas(64) PGContext
 };
 
 void pg_init_context(uintptr_t ctx);
+void pg_reset_timeout(uintptr_t ctx);
 void pg_check_timeout(uintptr_t ctx);

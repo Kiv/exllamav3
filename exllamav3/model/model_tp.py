@@ -477,14 +477,12 @@ class Model_TPMixin:
 
         # Create TP context
         self.active_devices = active_devices
-        # P2P landing slot: one prefill chunk of the residual stream at 16 bits. Larger payloads (fp32
-        # residual streams, oversized chunks) take the CPU-assisted reduce instead
+        # P2P landing slot: one prefill chunk of the residual stream at the widest wire in use; larger
+        # payloads take the CPU-assisted reduce instead
         p2p_slot_size = None
         if tp_backend == "p2p":
-            hidden = getattr(config, "hidden_size", None) or 8192
-            p2p_slot_size = int(os.environ.get("EXL3_TP_P2P_SLOT_MB", "0") or "0") * 1024 ** 2
-            if not p2p_slot_size:
-                p2p_slot_size = max_chunk_size * hidden * 2
+            wire_bytes = 4 if os.environ.get("EXL3_TP_P2P_FP32", "0") != "0" else 2
+            p2p_slot_size = max_chunk_size * config.hidden_size * wire_bytes
         self.create_tp_context(tp_backend, p2p_slot_size)
 
         # Split model

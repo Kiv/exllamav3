@@ -19,10 +19,16 @@ from ..util import log_tp
 GLOBALS_SIZE = 128*1024
 SHBUF_SIZE = 16 * 1024 ** 2
 _nccl_fp32 = os.environ.get("EXL3_TP_NCCL_FP32", "0") != "0"
-_no_p2p = os.environ.get("EXL3_TP_NO_P2P", "0") != "0"
-_p2p_trace = os.environ.get("EXL3_TP_P2P_TRACE", "0") != "0"
 _p2p_fp32 = os.environ.get("EXL3_TP_P2P_FP32", "0") != "0"
-P2P_SETUP_TIMEOUT_MS = 60000
+_no_fp16_wire = os.environ.get("EXL3_TP_NO_FP16_WIRE", "0") != "0"
+# Longer than the device-side sync deadline (SYNC_TIMEOUT * 45 s), so a rank whose probe kernel is still
+# spinning for a peer that already gave up gets to publish its verdict before the others stop waiting for it.
+# A host timeout shorter than the device one would let the ranks disagree about the path they are on
+P2P_SETUP_TIMEOUT_MS = 120000
+# Flag round the ranks use to agree that every peer arena is unmapped before any of them is freed
+P2P_SETUP_ROUNDS = 3   # setup stages 0..2; round 3 is the release barrier
+P2P_RELEASE_ROUND = 3
+P2P_RELEASE_TIMEOUT_MS = 30000
 # 17 slots (16 devices + accumulator) x 2MB: 8 ring stages of the 256KB reduce chunk size
 SHBUF_SIZE_R = 17 * 8 * 256 * 1024
 SHBUF_SIZE_S = 16 * 1024
@@ -590,18 +596,15 @@ class TPBackendP2P(TPBackendNative):
         EXL3_TP_P2P_FP32=1 reduces fp32 payloads over an exact fp32 wire instead.
 
         Setup is a handshake through the G region: every rank publishes its IPC handle and a verdict for each of
-        three stages (arena exported, peers mapped, probe reduce correct). Any rank failing any stage, or
-        EXL3_TP_NO_P2P=1, makes every rank fall back to the CPU-assisted reduce, so the ranks always agree on
-        the path. Payloads larger than one landing slot also take the CPU-assisted path, which stays live for
-        that reason.
+        three stages (arena exported, peers mapped, probe reduce correct). Any rank failing any stage makes
+        every rank fall back to the CPU-assisted reduce, so the ranks always agree on the path. Payloads larger
+        than one landing slot also take the CPU-assisted path, which stays live for that reason.
         """
         super().__init__(device, active_devices, output_device, init_method, master, uuid, shbuf_size, cpu)
         self.use_p2p = False
         self.slot_size = slot_size
         self.arena = 0
         self.peer_arenas = {}
-        self.n_p2p = 0
-        self.n_fallback = 0
         self.output_device = output_device
         if self.cpu or self.device < 0:
             # The helper process keeps running the CPU reduce loop regardless of the verdict: with P2P active it
@@ -622,16 +625,22 @@ class TPBackendP2P(TPBackendNative):
         Publish this rank's verdict for a setup stage and wait for every CUDA rank's. Non-master ranks wait for the
         master's verdict first, so nothing is published before the master has initialized the shared context.
         """
+        def give_up(reason):
+            # Publish a failure for this and every later stage before leaving, so a rank still catching up
+            # cannot read an all-pass verdict and go on alone
+            self.p2p_reason = f"stage {stage}: {reason}"
+            for r in range(stage, P2P_SETUP_ROUNDS):
+                ext.pg_p2p_flag_set(self.ptr_g, r, self.device, 2)
+            return False
+
         if not self.master:
             v = ext.pg_p2p_flag_wait(self.ptr_g, stage, [self.output_device], P2P_SETUP_TIMEOUT_MS)
             if not v[0]:
-                self.p2p_reason = f"stage {stage}: timeout waiting for master"
-                return False
+                return give_up("timeout waiting for master")
         ext.pg_p2p_flag_set(self.ptr_g, stage, self.device, 1 if ok else 2)
         values = ext.pg_p2p_flag_wait(self.ptr_g, stage, self.active_devices, P2P_SETUP_TIMEOUT_MS)
         if any(v == 0 for v in values):
-            self.p2p_reason = f"stage {stage}: timeout waiting for ranks"
-            return False
+            return give_up("timeout waiting for ranks")
         if any(v != 1 for v in values):
             if ok:
                 bad = [d for d, v in zip(self.active_devices, values) if v != 1]
@@ -645,9 +654,11 @@ class TPBackendP2P(TPBackendNative):
         if len(self.active_devices) < 2:
             ok = False
             self.p2p_reason = "single rank"
-        elif _no_p2p:
+        elif _no_fp16_wire:
+            # The direct reduce only implements the CPU helper's default wire choice, so rather than give
+            # fp16 payloads a second rounding the knob does not have on the CPU path, decline the whole path
             ok = False
-            self.p2p_reason = "EXL3_TP_NO_P2P set"
+            self.p2p_reason = "EXL3_TP_NO_FP16_WIRE set"
         else:
             for peer in self.active_devices:
                 if peer != self.device and not ext.pg_p2p_can_access(self.device, peer):
@@ -656,15 +667,13 @@ class TPBackendP2P(TPBackendNative):
                     break
         if ok:
             try:
-                size = ext.pg_p2p_arena_size(len(self.active_devices), self.slot_size)
-                self.arena = ext.pg_p2p_arena_create(self.device, size)
-                ext.pg_p2p_publish(self.ptr_g, self.device, self.arena)
-                log_tp(self.device, f"P2P arena created, {size} bytes")
+                self.arena = ext.pg_p2p_arena_create(self.ptr_g, self.device, len(self.active_devices), self.slot_size)
+                log_tp(self.device, "P2P arena created and exported")
             except RuntimeError as e:
                 ok = False
                 self.p2p_reason = f"arena export failed: {e}"
         if not self._p2p_verdict(0, ok):
-            self._p2p_teardown()
+            self._p2p_release()
             return
 
         # Map every peer's arena
@@ -678,7 +687,7 @@ class TPBackendP2P(TPBackendNative):
             ok = False
             self.p2p_reason = f"peer mapping failed: {e}"
         if not self._p2p_verdict(1, ok):
-            self._p2p_teardown()
+            self._p2p_release()
             return
 
         # Probe: a reduce of a deterministic pattern, checked against the host. Every rank reaches this point
@@ -690,7 +699,7 @@ class TPBackendP2P(TPBackendNative):
             ok = False
             self.p2p_reason = f"probe failed: {e}"
         if not self._p2p_verdict(2, ok):
-            self._p2p_teardown()
+            self._p2p_release()
             return
         self.use_p2p = True
 
@@ -701,8 +710,8 @@ class TPBackendP2P(TPBackendNative):
         def pattern(r):
             return ((idx * (r + 1) + r * 7) % 251) * 0.5 - 30.0
         expected = torch.zeros(n, dtype = torch.float32)
-        for d in sorted(self.active_devices):
-            expected += pattern(self.active_devices.index(d))
+        for r in range(len(self.active_devices)):
+            expected += pattern(r)
         expected = expected.half()
         mine = pattern(self.rank).half()
         x = torch.empty(n, dtype = torch.half, device = self.device)
@@ -721,14 +730,30 @@ class TPBackendP2P(TPBackendNative):
         return True
 
 
-    def _p2p_teardown(self):
-        if self.peer_arenas:
-            for peer, ptr in self.peer_arenas.items():
-                ext.pg_p2p_close(self.device, ptr)
-            self.peer_arenas = {}
+    def _p2p_release(self):
+        """
+        Unmap every peer's arena, wait for the other ranks to have done the same, then free this rank's own
+        arena. No rank may free memory another rank still has mapped, so the barrier is required; every rank
+        reaches this together, either because a setup stage failed for all of them or at close.
+        """
+        # Drain this rank's stream first: a peer that gave up mid-probe leaves this rank's kernel spinning
+        # until the device deadline, and it must not still hold a peer pointer when that peer frees its arena
+        torch.cuda.synchronize(self.device)
+        for ptr in self.peer_arenas.values():
+            ext.pg_p2p_close(self.device, ptr)
+        self.peer_arenas = {}
+        ext.pg_p2p_flag_set(self.ptr_g, P2P_RELEASE_ROUND, self.device, 1)
+        ext.pg_p2p_flag_wait(self.ptr_g, P2P_RELEASE_ROUND, self.active_devices, P2P_RELEASE_TIMEOUT_MS)
         if self.arena:
             ext.pg_p2p_arena_free(self.device, self.arena)
             self.arena = 0
+        self.use_p2p = False
+        # A spun-out probe leaves the group's sticky timeout and this rank's abort flag set; the native
+        # collectives check both, so the fallback would inherit them. The flag is allocated under
+        # inference mode, hence the guard around the in-place clear
+        with torch.inference_mode():
+            self.abort_flag.zero_()
+        ext.pg_reset_timeout(self.ptr_g)
 
 
     def _p2p_all_reduce(self, tensor: torch.Tensor):
@@ -753,26 +778,15 @@ class TPBackendP2P(TPBackendNative):
 
 
     def all_reduce(self, tensor: torch.Tensor, contribution: bool = True):
+        # A rank with no contribution (no heads on this rank) holds zeros, which the direct reduce sends like
+        # any other payload; only the CPU-assisted reduce skips them
         if self.use_p2p and self._p2p_fits(tensor):
-            self.n_p2p += 1
             self._p2p_all_reduce(tensor)
         else:
-            self.n_fallback += 1
             super().all_reduce(tensor, contribution)
 
 
     def close(self):
-        if _p2p_trace and self.device >= 0:
-            print(f" -- TP: device {self.device}: {self.n_p2p} P2P reduces, {self.n_fallback} CPU-assisted reduces", flush = True)
         if self.use_p2p or self.peer_arenas or self.arena:
-            # Unmap peers everywhere before anyone frees an exported arena
-            for peer, ptr in self.peer_arenas.items():
-                ext.pg_p2p_close(self.device, ptr)
-            self.peer_arenas = {}
-            ext.pg_p2p_flag_set(self.ptr_g, 3, self.device, 1)
-            ext.pg_p2p_flag_wait(self.ptr_g, 3, self.active_devices, 5000)
-            if self.arena:
-                ext.pg_p2p_arena_free(self.device, self.arena)
-                self.arena = 0
-            self.use_p2p = False
+            self._p2p_release()
         super().close()

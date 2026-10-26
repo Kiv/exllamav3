@@ -12,7 +12,6 @@
 #include <thread>
 #include <chrono>
 #include <cstring>
-#include <algorithm>
 
 // Payload dtypes and wire formats. The wire is what crosses the bus and what every rank sums; the rounding of
 // each contribution onto the wire and of the sum back to the payload dtype copies the CPU-assisted reduce
@@ -154,8 +153,10 @@ __device__ __forceinline__ void p2p_store_result(uint8_t* data, int line, const 
 // One launch per rank per reduce. Blocks stripe the payload in lines of 8 elements; each block has its own flag
 // per (src, slot), so blocks never synchronize with each other except through the done counter at the end.
 // Per block: push this stripe (already rounded onto the wire) into every peer's landing slot, release the
-// block flag in each peer, spin on the matching flags in local memory, then sum wire values in ascending
-// device order in fp32 and round once, exactly as the CPU-assisted reduce does
+// block flag in each peer, spin on the matching flags in local memory, then sum wire values in rank order in
+// fp32 and round once. Every rank sums the same values in the same order, so all ranks get identical results;
+// at two ranks that also matches the CPU-assisted reduce bit for bit, a two-term fp32 sum being commutative
+// (the CPU helper accumulates in arrival order, so beyond two ranks it has no fixed order to match)
 template <int DT, int WIRE>
 __global__ __launch_bounds__(P2P_NUM_THREADS)
 void pg_all_reduce_p2p_kernel
@@ -249,7 +250,7 @@ void pg_all_reduce_p2p_kernel
     __syncthreads();
 
     // 3. Sum in place: this rank's wire-rounded contribution plus every peer's landed line, accumulated in fp32
-    //    in ascending device order, rounded once. Landed lines are read with cache-global loads (written into
+    //    in rank order, rounded once. Landed lines are read with cache-global loads (written into
     //    this GPU's memory by a peer, so L1 must not serve them)
     if (!*((volatile uint32_t*) abort_flag))
     {
@@ -259,12 +260,13 @@ void pg_all_reduce_p2p_kernel
             uint4 w[WIRE_LINE];
             p2p_load_payload<DT>(data, line, mine);
             p2p_to_wire<WIRE>(mine, w);
-            // The first contribution is copied, not added to zero: 0 + (-0) would lose the sign of zero that
-            // the CPU helper's memcpy-then-add sequence keeps
+            // Rank 0's contribution is copied, not added to zero, so a -0.0 payload survives the way the
+            // CPU helper's memcpy-then-add keeps it. (One case still differs: where a rank declares no
+            // contribution the CPU helper skips its buffer entirely, while this kernel sums the zeros it
+            // holds, turning a -0.0 in another rank's payload into +0.0)
             float acc[P2P_LINE_ELEMS];
-            for (int k = 0; k < num_ranks; ++k)
+            for (int r = 0; r < num_ranks; ++r)
             {
-                int r = peers.sum_order[k];
                 float v[P2P_LINE_ELEMS];
                 if (r == this_rank)
                 {
@@ -280,7 +282,7 @@ void pg_all_reduce_p2p_kernel
                     p2p_from_wire<WIRE>(lw, v);
                 }
                 #pragma unroll
-                for (int j = 0; j < P2P_LINE_ELEMS; ++j) acc[j] = (k == 0) ? v[j] : acc[j] + v[j];
+                for (int j = 0; j < P2P_LINE_ELEMS; ++j) acc[j] = (r == 0) ? v[j] : acc[j] + v[j];
             }
             p2p_store_result<DT, WIRE>(data, line, acc);
         }
@@ -301,20 +303,32 @@ void pg_all_reduce_p2p_kernel
 }
 
 
-size_t pg_p2p_arena_size(int num_ranks, size_t slot_size)
+// Setup-path CUDA failures have to be recoverable: every rank agreeing to fall back to the CPU-assisted reduce
+// is the documented behaviour on a platform without working IPC (and cuda_check would exit the process instead
+// of raising), so these throw and surface in Python as RuntimeError
+static void p2p_check(cudaError_t e, const char* what)
 {
-    return (size_t) P2P_DATA_OFFSET + (size_t) P2P_NUM_SLOTS * num_ranks * slot_size;
+    if (e == cudaSuccess) return;
+    cudaGetLastError();   // clear, the caller falls back rather than aborting
+    TORCH_CHECK(false, "P2P setup: ", what, ": ", cudaGetErrorString(e));
 }
 
 
-uintptr_t pg_p2p_arena_create(int device, size_t size)
+uintptr_t pg_p2p_arena_create(uintptr_t ctx, int device, int num_ranks, size_t slot_size)
 {
+    static_assert(sizeof(cudaIpcMemHandle_t) == P2P_IPC_HANDLE_SIZE, "cudaIpcMemHandle_t size mismatch");
     const at::cuda::OptionalCUDAGuard device_guard(device);
+    const size_t size = (size_t) P2P_DATA_OFFSET + (size_t) P2P_NUM_SLOTS * num_ranks * slot_size;
     void* ptr = nullptr;
     // Dedicated allocation (not the caching allocator) so the IPC handle covers exactly this arena
-    cuda_check(cudaMalloc(&ptr, size));
-    cuda_check(cudaMemset(ptr, 0, size));
-    cuda_check(cudaDeviceSynchronize());
+    TORCH_CHECK(slot_size % sizeof(uint4) == 0, "pg_p2p_arena_create: slot size must be a multiple of 16");
+    p2p_check(cudaMalloc(&ptr, size), "arena alloc");
+    cudaError_t e = cudaMemset(ptr, 0, size);
+    if (e == cudaSuccess) e = cudaDeviceSynchronize();
+    cudaIpcMemHandle_t handle;
+    if (e == cudaSuccess) e = cudaIpcGetMemHandle(&handle, ptr);
+    if (e != cudaSuccess) { cudaFree(ptr); p2p_check(e, "arena export"); }
+    memcpy(((PGContext*) ctx)->p2p_ipc_handle[device], &handle, sizeof(handle));
     return (uintptr_t) ptr;
 }
 
@@ -336,17 +350,6 @@ bool pg_p2p_can_access(int device, int peer_device)
 }
 
 
-void pg_p2p_publish(uintptr_t ctx, int device, uintptr_t arena)
-{
-    static_assert(sizeof(cudaIpcMemHandle_t) == P2P_IPC_HANDLE_SIZE, "cudaIpcMemHandle_t size mismatch");
-    const at::cuda::OptionalCUDAGuard device_guard(device);
-    PGContext* ctx_ptr = (PGContext*) ctx;
-    cudaIpcMemHandle_t handle;
-    cuda_check(cudaIpcGetMemHandle(&handle, (void*) arena));
-    memcpy(ctx_ptr->p2p_ipc_handle[device], &handle, sizeof(handle));
-}
-
-
 uintptr_t pg_p2p_open(uintptr_t ctx, int device, int peer_device)
 {
     const at::cuda::OptionalCUDAGuard device_guard(device);
@@ -354,7 +357,7 @@ uintptr_t pg_p2p_open(uintptr_t ctx, int device, int peer_device)
     cudaIpcMemHandle_t handle;
     memcpy(&handle, ctx_ptr->p2p_ipc_handle[peer_device], sizeof(handle));
     void* ptr = nullptr;
-    cuda_check(cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess));
+    p2p_check(cudaIpcOpenMemHandle(&ptr, handle, cudaIpcMemLazyEnablePeerAccess), "peer arena map");
     return (uintptr_t) ptr;
 }
 
@@ -428,13 +431,8 @@ void pg_all_reduce_p2p
     const size_t wire_bytes = (size_t) numel * (wire_f32 ? 4 : 2);
     TORCH_CHECK(wire_bytes <= slot_size, "pg_all_reduce_p2p: payload exceeds landing slot");
 
-    P2PPeerArenas peers;
-    for (int r = 0; r < P2P_MAX_RANKS; ++r) { peers.arena[r] = nullptr; peers.sum_order[r] = 0; }
+    P2PPeerArenas peers = {};
     for (int r = 0; r < num_ranks; ++r) peers.arena[r] = (uint8_t*) arenas[r];
-    std::vector<int> order(num_ranks);
-    for (int r = 0; r < num_ranks; ++r) order[r] = r;
-    std::sort(order.begin(), order.end(), [&] (int a, int b) { return devices[a] < devices[b]; });
-    for (int r = 0; r < num_ranks; ++r) peers.sum_order[r] = (uint8_t) order[r];
 
     int num_blocks = (int) CEIL_DIVIDE(num_lines, P2P_NUM_THREADS);
     num_blocks = MAX(1, MIN(num_blocks, P2P_MAX_BLOCKS));
